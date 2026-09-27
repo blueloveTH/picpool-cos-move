@@ -2,7 +2,8 @@
 # Upload a split tar directory to a public GitHub repository and enable Pages.
 # Usage: bash publish.sh DIRECTORY [OWNER]
 # Authentication: GH_TOKEN / GITHUB_TOKEN, or a hidden interactive PAT prompt.
-# Requires: Bash, git, gh, tar, mktemp.
+# Requires: Bash, git, gh, tar, mktemp; ssh for SSH uploads.
+# PUBLISH_GIT_PROTOCOL: https (default) or ssh (ssh.github.com:443).
 # The directory must contain archive.tar.part01..30.
 # Upload dotfiles and ignored files, except .git, SUCCESS and obsolete metadata.
 set +x
@@ -11,6 +12,8 @@ set -Eeuo pipefail
 usage() {
   printf 'Usage: bash %s DIRECTORY [OWNER]\n' "${0##*/}"
   printf 'Example: bash %s ./my-site my-organization\n' "${0##*/}"
+  printf 'SSH: PUBLISH_GIT_PROTOCOL=ssh bash %s DIRECTORY [OWNER]\n' "${0##*/}"
+  printf 'PUBLISH_GIT_PROTOCOL: https (default) or ssh (ssh.github.com:443).\n'
 }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
@@ -32,6 +35,13 @@ for part in "$source_dir"/archive.tar.part{01..30}; do
 done
 owner=${2:-}
 [[ -z "$owner" || "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'Invalid owner name.'
+
+git_protocol=${PUBLISH_GIT_PROTOCOL:-https}
+[[ "$git_protocol" == https || "$git_protocol" == ssh ]] ||
+  die 'PUBLISH_GIT_PROTOCOL must be https or ssh.'
+if [[ "$git_protocol" == ssh ]]; then
+  command -v ssh >/dev/null || die 'Missing dependency: ssh'
+fi
 
 # Always replace the managed workflow so the current archive format takes effect.
 workflow_name=deploy-pages.yml
@@ -120,6 +130,11 @@ api() {
       -H 'Content-Type: application/json; charset=utf-8' "$@"
 }
 remote_git() {
+  if [[ "$git_protocol" == ssh ]]; then
+    # Honor the user's existing SSH configuration, keys and agent.
+    git -c pack.threads=1 -c pack.window=0 -c pack.compression=1 "$@"
+    return
+  fi
   # Apply these settings to this process only, including inherited low-speed
   # environment overrides. HTTP/1.1 avoids HTTP/2 issues on some proxy paths.
   GIT_HTTP_MAX_REQUESTS=1 GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME="$push_low_speed_time" \
@@ -131,16 +146,19 @@ remote_git() {
 push_commit() {
   local description=$1 data_bytes=${2:-0} push_attempt retry_delay
   local post_buffer_bytes expected_sha remote_tip remote_sha remote_ref
-  # Each push adds one file. Buffer that file plus modest pack overhead, up to
-  # 128 MiB, to avoid chunked POSTs for slices without allocating a huge buffer
-  # for every small-file push. This helps proxies that mishandle chunked data.
-  post_buffer_bytes=$((data_bytes + 8 * 1024 * 1024))
-  if (( post_buffer_bytes > 128 * 1024 * 1024 )); then
-    post_buffer_bytes=$((128 * 1024 * 1024))
+  local -a push_options=()
+  if [[ "$git_protocol" == https ]]; then
+    # Each push adds one file. Buffer it plus modest pack overhead, up to
+    # 128 MiB, to avoid chunked POSTs for slices on HTTPS connections.
+    post_buffer_bytes=$((data_bytes + 8 * 1024 * 1024))
+    if (( post_buffer_bytes > 128 * 1024 * 1024 )); then
+      post_buffer_bytes=$((128 * 1024 * 1024))
+    fi
+    push_options=(-c "http.postBuffer=$post_buffer_bytes")
   fi
   expected_sha=$(git rev-parse HEAD)
   for ((push_attempt=1; push_attempt<=push_attempt_limit; push_attempt++)); do
-    if remote_git -c "http.postBuffer=$post_buffer_bytes" \
+    if remote_git "${push_options[@]}" \
         push --progress --no-follow-tags --set-upstream origin HEAD:refs/heads/main; then
       return 0
     fi
@@ -170,9 +188,16 @@ IFS=$'\t' read -r login user_id <<< "$identity"
 owner=${owner:-$login}
 repo="$owner/$repo_name"
 repo_url="https://github.com/$repo"
+git_remote_url="$repo_url.git"
+if [[ "$git_protocol" == ssh ]]; then
+  git_remote_url="ssh://git@ssh.github.com:443/$repo.git"
+fi
 printf 'Account: %s\nPublic repository: %s\n' "$login" "$repo_url"
 printf 'Upload method: git; up to %s attempts per file.\n' "$push_attempt_limit"
-printf 'Git settings: HTTP/1.1, adaptive buffer up to 128 MiB, low-speed timeout %ss.\n' "$push_low_speed_time"
+printf 'Git transport: %s; remote: %s\n' "$git_protocol" "$git_remote_url"
+if [[ "$git_protocol" == https ]]; then
+  printf 'Git settings: HTTP/1.1, adaptive buffer up to 128 MiB, low-speed timeout %ss.\n' "$push_low_speed_time"
+fi
 
 # Upload a copy; leave the source archive slices and Git history intact.
 workdir=''
@@ -214,7 +239,7 @@ git add --all --force
 desired_tree=$(git write-tree)
 git ls-files -z > "$workdir/files.list"
 git read-tree --empty
-git remote add origin "$repo_url.git"
+git remote add origin "$git_remote_url"
 
 # Existing uploads may be a matching subset of the desired snapshot.
 printf 'Creating repository...\n'

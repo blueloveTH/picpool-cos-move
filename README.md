@@ -130,17 +130,29 @@ bash publish.sh ./cos_archives/某个UUID文件夹 my-organization
 
 PAT 需要创建公开仓库、推送内容和工作流、管理 Pages 设置、触发及读取 Actions 的权限。使用 classic PAT 时，需要相应的仓库权限和 `workflow` scope。不提供环境变量时，脚本会在交互终端中隐藏输入 PAT。
 
+默认通过 HTTPS 传输 Git 数据。可设置 `PUBLISH_GIT_PROTOCOL=ssh`，改用 `ssh://git@ssh.github.com:443/OWNER/REPO.git`；SSH 模式需要 `ssh` 命令及具有仓库写入权限的 SSH 密钥，沿用现有 SSH 配置和 agent。PAT 仍供 `gh` 创建仓库、管理 Pages 和触发部署使用。
+
+中途切换时，先按 `Ctrl+C` 停止当前脚本，再在 Git Bash 中验证 SSH 并用原来的目录重新执行：
+
+```bash
+ssh -T -p 443 git@ssh.github.com
+# 看到 Hi USERNAME! You've successfully authenticated 即表示验证成功
+PUBLISH_GIT_PROTOCOL=ssh bash publish.sh ./cos_archives/某个UUID文件夹
+```
+
+GitHub 的 SSH 验证命令成功时也返回退出码 1，应根据认证提示判断；详见 [GitHub SSH 验证说明](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/testing-your-ssh-connection)和 [SSH 使用 443 端口的说明](https://docs.github.com/en/authentication/troubleshooting-ssh/using-ssh-over-the-https-port)。如果原来指定了 `OWNER`，重跑时继续使用同一个 `OWNER`。脚本会以 SSH 检查并接续同一个远程仓库：已提交成功且内容相同的文件会跳过，尚未提交成功的当前分片会重新传输。目标目录中的 Git remote 不参与上传，实际上传使用脚本创建的临时仓库。
+
 脚本每次在目标文件夹生成 `.github/workflows/deploy-pages.yml`，默认覆盖同名旧工作流，使新模板生效。工作流会按 `01` 到 `30` 的顺序合并 tar 切片，解压到仓库根目录，再创建内容为 `ok` 的根目录 `index.html`。归档和发布流程均不再生成 `meta.json` 或 `.nojekyll`。运行环境中的切片会在解压后移除，部署包包含解压后的文件、`manifest.json` 及其他站点文件，本地切片保持完整。
 
 上传时，每个文件单独提交并通过 `git push` 推送：先按顺序上传 30 个切片，再上传其他文件，最后上传 `.github/workflows/` 中的文件。文件上传固定使用 Git；`gh` 负责认证、创建仓库、Pages 和 Actions 设置。空仓库直接从第一个文件开始提交和推送。只允许快进推送；如果推送报错，脚本会检查远程提交是否已经接收成功，确认成功后继续下一个文件。
 
 上传提交带有 `[skip ci]`，避免尚未上传完整时启动构建；所有文件上传完成后，脚本再手动触发部署工作流。参见 [GitHub 跳过工作流的说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)。每个文件默认最多尝试上传 8 次，重试间隔依次为 5、10、20、40、60、60、60 秒。再次运行会跳过已提交到远程的相同文件，此前通过 Git 或 API 提交成功的文件都可以继续复用。
 
-Git 连接使用 HTTP/1.1、并发 1，POST 缓冲按文件大小加 8MiB 计算、最大 128MiB；打包使用单线程、压缩等级 1，并关闭差量搜索。连续低于 1 字节/秒达 600 秒才中止传输。这些参数不会延长服务器或代理自身的请求期限，含义见 [Git 配置文档](https://git-scm.com/docs/git-config)。旧的 `PUBLISH_UPLOAD_METHOD` 和 `PUBLISH_API_TIMEOUT` 环境变量不再生效。
+HTTPS 模式下，Git 连接使用 HTTP/1.1、并发 1，POST 缓冲按文件大小加 8MiB 计算、最大 128MiB；打包使用单线程、压缩等级 1，并关闭差量搜索。连续低于 1 字节/秒达 600 秒才中止传输。这些参数不会延长服务器或代理自身的请求期限，含义见 [Git 配置文档](https://git-scm.com/docs/git-config)。旧的 `PUBLISH_UPLOAD_METHOD` 和 `PUBLISH_API_TIMEOUT` 环境变量不再生效。
 
 ```bash
 export PUBLISH_PUSH_ATTEMPTS=12      # 1～20，默认 8
-export PUBLISH_LOW_SPEED_TIME=900    # 1～3600 秒，默认 600
+export PUBLISH_LOW_SPEED_TIME=900    # 1～3600 秒，默认 600，仅 HTTPS 模式
 bash publish.sh ./cos_archives/某个UUID文件夹
 ```
 
