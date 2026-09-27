@@ -119,7 +119,7 @@ objects/
 
 ## 发布到 GitHub Pages
 
-`publish.sh` 接收一个包含 `archive.tar.part01` 到 `archive.tar.part30` 的 UUID 文件夹，创建同名公开 GitHub 仓库，通过 GitHub Actions 构建和部署 Pages。需要 Bash、Git、GitHub CLI（`gh`）和 tar；本地文件夹不需要 `index.html`。
+`publish.sh` 接收一个包含 `archive.tar.part01` 到 `archive.tar.part30` 的 UUID 文件夹，创建同名公开 GitHub 仓库，通过 GitHub Actions 构建和部署 Pages。需要 Bash、Git、GitHub CLI（`gh`）、tar、tee，以及 Python 3.9 及以上（`python3` 或 `python`）；Python 只使用标准库。本地文件夹不需要 `index.html`。
 
 ```bash
 export GH_TOKEN='你的 GitHub PAT'
@@ -132,15 +132,18 @@ PAT 需要创建公开仓库、推送内容和工作流、管理 Pages 设置、
 
 脚本每次在目标文件夹生成 `.github/workflows/deploy-pages.yml`，默认覆盖同名旧工作流，使新模板生效。工作流会按 `01` 到 `30` 的顺序合并 tar 切片，解压到仓库根目录，再创建内容为 `ok` 的根目录 `index.html`。归档和发布流程均不再生成 `meta.json` 或 `.nojekyll`。运行环境中的切片会在解压后移除，部署包包含解压后的文件、`manifest.json` 及其他站点文件，本地切片保持完整。
 
-上传时，每个文件单独提交并推送：先按顺序上传 30 个切片，再上传其他文件，最后上传 `.github/workflows/` 中的文件。分片数据通过 `git push` 传输，`gh` 用于认证和仓库、Pages、Actions 设置。上传提交带有 `[skip ci]`，避免尚未上传完整时启动构建；所有文件上传完成后，脚本再手动触发部署工作流。参见 [GitHub 跳过工作流的说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)。
+上传时，每个文件单独提交：先按顺序上传 30 个切片，再上传其他文件，最后上传 `.github/workflows/` 中的文件。默认通过 `gh api` 调用 GitHub 的 Git 数据库 API，逐个写入文件对象、目录和提交，再更新 `main`，大文件不再通过 `git push` 发送。使用同一个 PAT 即可；API 请求中的二进制内容使用 Base64 编码，网络数据量约增加三分之一。参见 [GitHub 文件对象 API](https://docs.github.com/en/rest/git/blobs)。空仓库先通过一个不含文件的 Git 提交建立 `main`；已有部分上传的仓库直接继续。Git 仅推送这个很小的初始化提交，并读取远程提交和目录元数据。
 
-上传连接固定使用 HTTP/1.1，并限制 HTTP 并发为 1。每次推送的 POST 缓冲按文件大小加 8MiB 计算，最大 128MiB，用于减少部分代理对分块传输的兼容性问题；小文件不会分配整个上限。Git 打包使用单线程、压缩等级 1，并关闭跨对象的差量搜索，降低二进制切片的打包开销。连续传输速度低于 1 字节/秒达 600 秒才中止连接。这些设置只作用于脚本运行的 Git 进程，含义见 [Git 配置文档](https://git-scm.com/docs/git-config)。
+API 上传逐个核对文件和目录的 Git 哈希，并只允许快进更新分支。更新成功后如果响应丢失，重试时会确认远程提交，避免再次发送该文件。同一次运行中，已成功写入的文件对象、目录和提交也会复用。写请求之间至少间隔 1 秒；若触发 API 限流，脚本停止并保留进度，待限制重置后可重新执行。参见 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)。
 
-每个文件默认最多尝试推送 8 次。失败后先检查远程 `main` 是否已指向本次提交，若服务器已经收到，则直接继续；否则按 5、10、20、40、60、60、60 秒的间隔重试。再次运行仍可跳过已经上传成功的文件。可以通过环境变量调整尝试次数和低速等待时间：
+上传提交带有 `[skip ci]`，避免尚未上传完整时启动构建；所有文件上传完成后，脚本再手动触发部署工作流。参见 [GitHub 跳过工作流的说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)。每个文件默认最多尝试上传 8 次，重试间隔依次为 5、10、20、40、60、60、60 秒。再次运行会跳过已提交到远程的相同文件，可以直接接着原来的 Git 上传进度继续。
+
+`PUBLISH_UPLOAD_METHOD` 默认是 `api`。设为 `git` 可使用原来的逐文件 Git 推送；设为 `auto` 则先使用 Git，连续两次 HTTP 408 后切换为 API，当前和后续文件均使用 API。Git 连接使用 HTTP/1.1、并发 1，POST 缓冲按文件大小加 8MiB 计算、最大 128MiB；打包使用单线程、压缩等级 1，并关闭差量搜索。连续低于 1 字节/秒达 600 秒才中止传输。这些 Git 参数不会延长服务器或代理自身的请求期限，也不作用于 API 请求，含义见 [Git 配置文档](https://git-scm.com/docs/git-config)。
 
 ```bash
-export PUBLISH_PUSH_ATTEMPTS=12       # 1～20，默认 8，包含首次尝试
-export PUBLISH_LOW_SPEED_TIME=900     # 1～3600 秒，默认 600
+export PUBLISH_UPLOAD_METHOD=api      # 默认 api；可选 git、auto
+export PUBLISH_PUSH_ATTEMPTS=12       # 1～20，默认 8，适用于 API 和 Git
+export PUBLISH_LOW_SPEED_TIME=900     # 1～3600 秒，默认 600，只影响 Git
 bash publish.sh ./cos_archives/某个UUID文件夹
 ```
 
