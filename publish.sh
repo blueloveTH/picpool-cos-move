@@ -2,7 +2,7 @@
 # Upload a split tar directory to a public GitHub repository and enable Pages.
 # Usage: bash publish.sh DIRECTORY [OWNER]
 # Authentication: GH_TOKEN / GITHUB_TOKEN, or a hidden interactive PAT prompt.
-# Requires: Bash, git, gh, tar, tee; Python 3.9+ for API uploads (the default).
+# Requires: Bash, git, gh, curl, tar, tee; Python 3.9+ for API uploads (the default).
 # The directory must contain archive.tar.part01..30.
 # Upload dotfiles and ignored files, except .git, SUCCESS and obsolete metadata.
 set +x
@@ -21,7 +21,7 @@ if [[ -f "$source_dir/SUCCESS" ]]; then
   printf 'Already published (SUCCESS exists), skipping: %s\n' "$source_dir"
   exit 0
 fi
-for command_name in git gh tar mktemp tee; do
+for command_name in git gh curl tar mktemp tee; do
   command -v "$command_name" >/dev/null || die "Missing dependency: $command_name"
 done
 repo_name=${source_dir##*/}
@@ -109,11 +109,14 @@ fi
 [[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
 push_attempt_limit=${PUBLISH_PUSH_ATTEMPTS:-8}
 push_low_speed_time=${PUBLISH_LOW_SPEED_TIME:-600}
+api_timeout=${PUBLISH_API_TIMEOUT:-900}
 upload_method=${PUBLISH_UPLOAD_METHOD:-api}
 [[ "$push_attempt_limit" =~ ^[1-9][0-9]*$ && ${#push_attempt_limit} -le 2 && "$push_attempt_limit" -le 20 ]] ||
   die 'PUBLISH_PUSH_ATTEMPTS must be an integer from 1 to 20.'
 [[ "$push_low_speed_time" =~ ^[1-9][0-9]*$ && ${#push_low_speed_time} -le 4 && "$push_low_speed_time" -le 3600 ]] ||
   die 'PUBLISH_LOW_SPEED_TIME must be an integer from 1 to 3600 seconds.'
+[[ "$api_timeout" =~ ^[1-9][0-9]*$ && ${#api_timeout} -le 4 && "$api_timeout" -le 7200 ]] ||
+  die 'PUBLISH_API_TIMEOUT must be an integer from 1 to 7200 seconds.'
 [[ "$upload_method" == auto || "$upload_method" == git || "$upload_method" == api ]] ||
   die 'PUBLISH_UPLOAD_METHOD must be auto, git or api.'
 active_upload_method=git
@@ -143,36 +146,64 @@ api() {
       -H 'Content-Type: application/json; charset=utf-8' "$@"
 }
 api_write() {
-  local argument flag='' input_file='' request_method='' request_path='' body_bytes=0
-  local headers=()
-  for argument in "$@"; do
-    if [[ -n "$flag" ]]; then
-      case "$flag" in
-        --input) input_file=$argument ;;
-        --method) request_method=$argument ;;
-      esac
-      flag=''
-    else
-      case "$argument" in
-        --input|--method|--jq|-f|-F|-H) flag=$argument ;;
-        *) request_path=$argument ;;
-      esac
-    fi
-  done
-  if [[ -n "$input_file" && "$input_file" != - ]]; then
-    body_bytes=$("$api_python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).stat().st_size)' \
-      "$input_file") || return 1
-    # A file reader has unknown length to Go's HTTP client. Tell gh the exact
-    # byte length to avoid chunked transfer or missing HTTP/2 request framing.
-    headers=(-H "Content-Length: $body_bytes")
-  fi
+  local request_method=$1 request_path=$2 input_file=$3 body_bytes http_status
+  body_bytes=$("$api_python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).stat().st_size)' \
+    "$input_file") || return 1
   # Space content-creating requests to reduce secondary API rate limits.
   sleep 1
-  if api "${headers[@]}" "$@" 2>"$workdir/api-error.log"; then return 0; fi
-  printf 'API %s /%s failed (request body: %s bytes):\n' \
-    "$request_method" "$request_path" "$body_bytes" >&2
-  cat "$workdir/api-error.log" >&2
-  return 1
+  : > "$workdir/api-error.log" || return 1
+  # Pass the PAT through stdin, not process arguments or a file. Send a known
+  # length JSON body with curl, independently of gh's Go HTTP transport.
+  if ! http_status=$(
+    "$api_python" -c 'import json, os; token = os.environ["GH_TOKEN"]; assert "\r" not in token and "\n" not in token, "Invalid PAT"; print("header = " + json.dumps("Authorization: Bearer " + token))' |
+      curl --disable --config - --http1.1 --proto '=https' \
+        --silent --show-error --connect-timeout 30 --max-time "$api_timeout" \
+        --keepalive-time 30 --request "$request_method" \
+        --user-agent 'picpool-cos-move' \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'Content-Type: application/json; charset=utf-8' \
+        --header "Content-Length: $body_bytes" --header 'Transfer-Encoding:' --header 'Expect:' \
+        --data-binary "@$input_file" --output "$workdir/api-response.json" \
+        --dump-header "$workdir/api-response.headers" --write-out '%{http_code}' \
+        "https://api.github.com/$request_path" 2>"$workdir/api-error.log"
+  ); then
+    printf 'API %s /%s transfer failed (request body: %s bytes):\n' \
+      "$request_method" "$request_path" "$body_bytes" >&2
+    cat "$workdir/api-error.log" >&2
+    return 1
+  fi
+  "$api_python" - "$workdir" "$http_status" "$request_method" "$request_path" "$body_bytes" <<'RESPONSE_PYTHON'
+import json
+from pathlib import Path
+import re
+import sys
+
+directory = Path(sys.argv[1])
+status, method, endpoint, body_bytes = sys.argv[2:]
+text = (directory / "api-response.json").read_text(encoding="utf-8", errors="replace")
+try:
+    result = json.loads(text)
+except ValueError:
+    result = {}
+if status.startswith("2") and isinstance(result, dict):
+    sha = result.get("sha") or result.get("object", {}).get("sha")
+    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
+        print(sha)
+        sys.exit(0)
+message = result.get("message", "Invalid API response") if isinstance(result, dict) else "Invalid API response"
+if not result:
+    message = text[:500] or "Empty response"
+request_id = ""
+for line in (directory / "api-response.headers").read_text(encoding="utf-8", errors="replace").splitlines():
+    if line.lower().startswith("x-github-request-id:"):
+        request_id = line.split(":", 1)[1].strip()
+error = f"API {method} /{endpoint} failed (HTTP {status}, request body: {body_bytes} bytes): {message}"
+if request_id:
+    error += f"\nGitHub request ID: {request_id}"
+(directory / "api-error.log").write_text(error + "\n", encoding="utf-8")
+print(error, file=sys.stderr)
+sys.exit(1)
+RESPONSE_PYTHON
 }
 remote_git() {
   # Apply these settings to this process only, including inherited low-speed
@@ -186,6 +217,7 @@ remote_git() {
 prepare_api_commit() {
   "$api_python" - "$1" <<'PYTHON'
 import base64
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -230,14 +262,21 @@ write_json("commit.json", {"message": message, "tree": tree_sha, "parents": [par
 # Stream Base64 to disk; large binary slices never enter shell arguments or
 # require loading the whole file and encoded JSON into Python memory.
 for sha in sorted(blobs):
+    size = int(git("cat-file", "-s", sha))
+    digest = hashlib.sha1(f"blob {size}\0".encode("ascii"))
+    read_bytes = 0
     with (destination / f"{sha}.blob.json").open("wb") as output:
         output.write(b'{"encoding":"base64","content":"')
         with subprocess.Popen(["git", "cat-file", "blob", sha], stdout=subprocess.PIPE) as process:
             while block := process.stdout.read(3 * 256 * 1024):
+                digest.update(block)
+                read_bytes += len(block)
                 output.write(base64.b64encode(block))
             if process.wait() != 0:
                 raise RuntimeError(f"Unable to read Git blob {sha}")
         output.write(b'"}')
+    if read_bytes != size or digest.hexdigest() != sha:
+        raise RuntimeError(f"Incomplete or changed Git blob {sha}")
 PYTHON
 }
 finish_api_commit() {
@@ -290,27 +329,24 @@ upload_api_commit() {
     blob_sha=${blob_file##*/}
     blob_sha=${blob_sha%.blob.json}
     [[ ! -f "$api_dir/$blob_sha.uploaded" ]] || continue
-    returned_sha=$(api_write --method POST "repos/$repo/git/blobs" \
-      --input "$blob_file" --jq '.sha') || return 1
+    returned_sha=$(api_write POST "repos/$repo/git/blobs" "$blob_file") || return 1
     [[ "$returned_sha" == "$blob_sha" ]] || die 'GitHub returned a different file hash.'
     : > "$api_dir/$blob_sha.uploaded" || return 1
   done
   if [[ ! -f "$api_dir/tree.sha" ]]; then
-    tree_sha=$(api_write --method POST "repos/$repo/git/trees" \
-      --input "$api_dir/tree.json" --jq '.sha') || return 1
+    tree_sha=$(api_write POST "repos/$repo/git/trees" "$api_dir/tree.json") || return 1
     [[ "$tree_sha" == "$expected_tree" ]] || die 'GitHub returned a different directory hash.'
     printf '%s\n' "$tree_sha" > "$api_dir/tree.sha" || return 1
   fi
   if [[ ! -f "$api_dir/commit.sha" ]]; then
-    api_sha=$(api_write --method POST "repos/$repo/git/commits" \
-      --input "$api_dir/commit.json" --jq '.sha') || return 1
+    api_sha=$(api_write POST "repos/$repo/git/commits" "$api_dir/commit.json") || return 1
     [[ "$api_sha" =~ ^[0-9a-f]{40}$ ]] || die 'GitHub returned an invalid commit hash.'
     printf '%s\n' "$api_sha" > "$api_dir/commit.sha" || return 1
   fi
   api_sha=$(<"$api_dir/commit.sha")
   # Fast-forward only: another writer's changes must never be force-overwritten.
-  api_write --method PATCH "repos/$repo/git/refs/heads/main" \
-    -f "sha=$api_sha" -F force=false >/dev/null || return 1
+  printf '{"sha":"%s","force":false}\n' "$api_sha" > "$api_dir/reference.json" || return 1
+  api_write PATCH "repos/$repo/git/refs/heads/main" "$api_dir/reference.json" >/dev/null || return 1
   finish_api_commit "$old_head" "$api_sha" "$expected_tree" "$api_dir" || return 1
   printf 'Uploaded through GitHub API: %s\n' "$description"
 }
@@ -385,6 +421,9 @@ repo="$owner/$repo_name"
 repo_url="https://github.com/$repo"
 printf 'Account: %s\nPublic repository: %s\n' "$login" "$repo_url"
 printf 'Upload method: %s; up to %s attempts per file.\n' "$upload_method" "$push_attempt_limit"
+if [[ "$upload_method" != git ]]; then
+  printf 'API transport: curl, HTTP/1.1, fixed Content-Length, timeout %ss.\n' "$api_timeout"
+fi
 if [[ "$upload_method" != api ]]; then
   printf 'Git settings: HTTP/1.1, adaptive buffer up to 128 MiB, low-speed timeout %ss.\n' "$push_low_speed_time"
 fi
