@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按 COS LastModified 顺序下载，分窗口归档为 10 个 <=100MB 的 tar 分片。
+"""按 COS LastModified 分窗口并发下载，归档为 10 个 <=100MB 的 tar 分片。
 
 Python >=3.9。首次运行缺少 SDK 时自动安装 cos-python-sdk-v5。
 凭据从 COS_SECRET_ID / COS_SECRET_KEY / COS_TOKEN 环境变量读取。
@@ -25,6 +25,7 @@ import tempfile
 import time
 import uuid
 from contextlib import closing
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
@@ -142,6 +143,7 @@ def download_object(
     client: Any, bucket: str, obj: ObjectInfo, path: Path, attempts: int
 ) -> Downloaded:
     """流式保存原始字节；条件 GET 避免列表收集后对象被覆盖。"""
+    LOG.debug("下载 %r（%d 字节）", obj.key, obj.size)
     for attempt in range(1, attempts + 1):
         try:
             response = client.get_object(
@@ -195,6 +197,43 @@ def download_object(
             LOG.warning("下载 %r 失败，准备重试 %d/%d：%s", obj.key, attempt + 1, attempts, exc)
             time.sleep(min(2 ** (attempt - 1), 8))
     raise AssertionError("attempts 必须为正数")
+
+
+def download_window(
+    client: Any, bucket: str, window: list[tuple[ObjectInfo, Path]],
+    executor: ThreadPoolExecutor, *, workers: int, attempts: int,
+) -> list[Downloaded]:
+    """限制未完成的任务数，并按输入时间顺序返回下载结果。"""
+    jobs = iter(enumerate(window))
+    pending: dict[Future[Downloaded], int] = {}
+    results: dict[int, Downloaded] = {}
+
+    def fill_slots() -> None:
+        while len(pending) < workers:
+            try:
+                index, (obj, path) = next(jobs)
+            except StopIteration:
+                return
+            future = executor.submit(download_object, client, bucket, obj, path, attempts)
+            pending[future] = index
+
+    try:
+        fill_slots()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            # 先检查本轮完成的所有任务，再补任务；发现错误后不再发起新下载。
+            for future in done:
+                index = pending.pop(future)
+                results[index] = future.result()
+            fill_slots()
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        # 运行中的线程结束前不能删除缓存，否则 Windows 会遇到文件占用，
+        # 或者下载线程在清理后继续写出文件。
+        wait(pending)
+        raise
+    return [results[index] for index in range(len(window))]
 
 
 class SplitTarWriter:
@@ -321,32 +360,38 @@ def export_bucket(
     client: Any, bucket: str, prefix: str, output_dir: Path, *,
     max_folders: int = 10, window_limit: int = WINDOW_BYTES,
     part_max: int = PART_MAX_BYTES, temp_dir: Path | None = None,
-    attempts: int = 3, skip_oversized: bool = False,
+    attempts: int = 3, skip_oversized: bool = False, workers: int = 8,
 ) -> list[Path]:
-    """第二次遍历排序后的 key；窗口不重叠，对象不跨文件夹切割。"""
-    if min(max_folders, window_limit, part_max, attempts) <= 0:
-        raise ValueError("数量、大小限制和尝试次数必须为正数")
+    """按时间分配窗口，在单个窗口内并发下载；对象不跨文件夹切割。"""
+    if min(max_folders, window_limit, part_max, attempts, workers) <= 0:
+        raise ValueError("数量、大小限制、尝试次数和并发数必须为正数")
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     completed: list[Path] = []
     with tempfile.TemporaryDirectory(prefix="cos-download-", dir=temp_dir) as scratch:
         scratch_path = Path(scratch)
-        with closing(sqlite3.connect(scratch_path / "index.sqlite3")) as db:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cos-download") as executor, \
+                closing(sqlite3.connect(scratch_path / "index.sqlite3")) as db:
             count = collect_objects(client, bucket, prefix, db)
-            LOG.info("收集完成：%d 个对象，开始按时间排序下载", count)
-            window: list[Downloaded] = []
+            LOG.info("收集完成：%d 个对象，按时间分窗口，并发下载数 %d", count, workers)
+            window: list[tuple[ObjectInfo, Path]] = []
             payload = 0
             tar_members = 0
             meta_size = 3  # 空 JSON 映射与结尾换行。
 
             def flush() -> None:
                 nonlocal payload, tar_members, meta_size
-                folder = publish_window(window, output_dir, bucket, window_limit, part_max)
+                LOG.info("下载窗口 %d：%d 个对象，%.3f MB，并发数 %d",
+                         len(completed) + 1, len(window), payload / MB, workers)
+                downloaded_items = download_window(
+                    client, bucket, window, executor, workers=workers, attempts=attempts
+                )
+                folder = publish_window(downloaded_items, output_dir, bucket, window_limit, part_max)
                 completed.append(folder)
                 LOG.info("完成文件夹 %d/%d：%s；%d 个对象，%.3f MB",
                          len(completed), max_folders, folder.name, len(window), payload / MB)
-                for downloaded in window:
+                for downloaded in downloaded_items:
                     downloaded.path.unlink()
                 window.clear()
                 payload = 0
@@ -373,11 +418,8 @@ def export_bucket(
                             LOG.warning("%s，按 --skip-oversized 跳过", message)
                             continue
                         raise ValueError(message + "；可显式使用 --skip-oversized")
-                    LOG.debug("下载 %r（%d 字节）", obj.key, obj.size)
-                    downloaded = download_object(
-                        client, bucket, obj, scratch_path / f"object-{index:012d}", attempts
-                    )
-                    window.append(downloaded)
+                    # 只分配当前窗口的对象；先按列表大小预留容量，再并发下载。
+                    window.append((obj, scratch_path / f"object-{index:012d}"))
                     payload += obj.size
                     tar_members += cost
                     meta_size += meta_cost
@@ -385,7 +427,7 @@ def export_bucket(
                         flush()
                         if len(completed) >= max_folders:
                             return completed
-            # COS 遍历结束：保存最后一个未满窗口，不丢弃已下载的对象。
+            # COS 遍历结束：下载并保存最后一个未满窗口。
             if window:
                 flush()
     return completed
@@ -407,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--temp-dir", type=Path, help="下载缓存和 SQLite 临时目录，默认系统临时目录")
     parser.add_argument("--max-folders", type=positive_int, default=10, help="本次运行最多创建的文件夹数量，默认 10")
     parser.add_argument("--window-mb", type=positive_int, default=990, help="对象原始字节窗口上限，1~990 MB，默认 990")
+    parser.add_argument("--workers", type=positive_int, default=8, help="并发下载对象数，默认 8；设为 1 使用串行下载")
     parser.add_argument("--attempts", type=positive_int, default=3, help="完整下载的最多尝试次数，默认 3")
     parser.add_argument("--timeout", type=positive_int, default=60, help="COS 请求超时秒数，默认 60")
     parser.add_argument("--skip-oversized", action="store_true", help="显式跳过无法装入单个窗口的对象；默认报错")
@@ -438,11 +481,13 @@ def main(argv: list[str] | None = None) -> int:
         client = CosS3Client(CosConfig(
             Region=args.region, SecretId=secret_id, SecretKey=secret_key,
             Token=os.environ.get("COS_TOKEN") or None, Scheme="https", Timeout=args.timeout,
+            PoolConnections=max(10, args.workers), PoolMaxSize=max(10, args.workers),
         ), retry=3)
         folders = export_bucket(
             client, args.bucket, args.prefix, args.output_dir,
             max_folders=args.max_folders, window_limit=args.window_mb * MB,
             temp_dir=args.temp_dir, attempts=args.attempts, skip_oversized=args.skip_oversized,
+            workers=args.workers,
         )
         LOG.info("结束，本次创建 %d 个文件夹；输出目录：%s", len(folders), args.output_dir.resolve())
         return 0
