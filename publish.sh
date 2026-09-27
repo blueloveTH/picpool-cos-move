@@ -135,11 +135,42 @@ ensure_api_python() {
 if [[ "$upload_method" == api ]]; then
   ensure_api_python || die 'Unable to enable API uploads.'
 fi
-api() { gh api --hostname github.com -H 'Accept: application/vnd.github+json' "$@"; }
+api() {
+  # Raw --input bodies are streams, so gh does not infer JSON headers. Keep
+  # both API and Git traffic on HTTP/1.1 for proxy compatibility.
+  GODEBUG="${GODEBUG:+$GODEBUG,}http2client=0" \
+    gh api --hostname github.com -H 'Accept: application/vnd.github+json' \
+      -H 'Content-Type: application/json; charset=utf-8' "$@"
+}
 api_write() {
+  local argument flag='' input_file='' request_method='' request_path='' body_bytes=0
+  local headers=()
+  for argument in "$@"; do
+    if [[ -n "$flag" ]]; then
+      case "$flag" in
+        --input) input_file=$argument ;;
+        --method) request_method=$argument ;;
+      esac
+      flag=''
+    else
+      case "$argument" in
+        --input|--method|--jq|-f|-F|-H) flag=$argument ;;
+        *) request_path=$argument ;;
+      esac
+    fi
+  done
+  if [[ -n "$input_file" && "$input_file" != - ]]; then
+    body_bytes=$("$api_python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).stat().st_size)' \
+      "$input_file") || return 1
+    # A file reader has unknown length to Go's HTTP client. Tell gh the exact
+    # byte length to avoid chunked transfer or missing HTTP/2 request framing.
+    headers=(-H "Content-Length: $body_bytes")
+  fi
   # Space content-creating requests to reduce secondary API rate limits.
   sleep 1
-  if api "$@" 2>"$workdir/api-error.log"; then return 0; fi
+  if api "${headers[@]}" "$@" 2>"$workdir/api-error.log"; then return 0; fi
+  printf 'API %s /%s failed (request body: %s bytes):\n' \
+    "$request_method" "$request_path" "$body_bytes" >&2
   cat "$workdir/api-error.log" >&2
   return 1
 }
@@ -303,6 +334,9 @@ push_commit() {
         api_error=$(<"$workdir/api-error.log")
         if [[ "$api_error" == *'HTTP 429'* || "${api_error,,}" == *'rate limit'* ]]; then
           die 'GitHub API rate limit reached; resume after the limit resets. Uploaded files have been kept.'
+        fi
+        if [[ "$api_error" == *'HTTP 400'* || "$api_error" == *'HTTP 413'* || "$api_error" == *'HTTP 422'* ]]; then
+          die 'GitHub rejected this API request; see its endpoint, size and error above. Uploaded files have been kept.'
         fi
       fi
     else

@@ -134,7 +134,7 @@ PAT 需要创建公开仓库、推送内容和工作流、管理 Pages 设置、
 
 上传时，每个文件单独提交：先按顺序上传 30 个切片，再上传其他文件，最后上传 `.github/workflows/` 中的文件。默认通过 `gh api` 调用 GitHub 的 Git 数据库 API，逐个写入文件对象、目录和提交，再更新 `main`，大文件不再通过 `git push` 发送。使用同一个 PAT 即可；API 请求中的二进制内容使用 Base64 编码，网络数据量约增加三分之一。参见 [GitHub 文件对象 API](https://docs.github.com/en/rest/git/blobs)。空仓库先通过一个不含文件的 Git 提交建立 `main`；已有部分上传的仓库直接继续。Git 仅推送这个很小的初始化提交，并读取远程提交和目录元数据。
 
-API 上传逐个核对文件和目录的 Git 哈希，并只允许快进更新分支。更新成功后如果响应丢失，重试时会确认远程提交，避免再次发送该文件。同一次运行中，已成功写入的文件对象、目录和提交也会复用。写请求之间至少间隔 1 秒；若触发 API 限流，脚本停止并保留进度，待限制重置后可重新执行。参见 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)。
+API 上传固定使用 HTTP/1.1，并明确设置 JSON 的 `Content-Type` 和请求文件的 `Content-Length`，避免 `gh --input` 的未知长度文件流影响代理兼容性。参见 [GitHub CLI 请求实现](https://github.com/cli/cli/blob/trunk/pkg/cmd/api/http.go)。上传逐个核对文件和目录的 Git 哈希，并只允许快进更新分支。更新成功后如果响应丢失，重试时会确认远程提交，避免再次发送该文件。同一次运行中，已成功写入的文件对象、目录和提交也会复用。写请求之间至少间隔 1 秒；若触发 API 限流，脚本停止并保留进度，待限制重置后可重新执行。参见 [GitHub API 限流说明](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)。HTTP 400、413、422 会打印失败接口和请求大小后停止，避免反复发送同一个被拒绝的请求。
 
 上传提交带有 `[skip ci]`，避免尚未上传完整时启动构建；所有文件上传完成后，脚本再手动触发部署工作流。参见 [GitHub 跳过工作流的说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)。每个文件默认最多尝试上传 8 次，重试间隔依次为 5、10、20、40、60、60、60 秒。再次运行会跳过已提交到远程的相同文件，可以直接接着原来的 Git 上传进度继续。
 
