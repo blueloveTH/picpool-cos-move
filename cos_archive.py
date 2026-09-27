@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按 COS LastModified 分窗口并发下载，归档为 30 个 <=100MB 的 tar 分片。
+"""按 COS LastModified 分窗口并发下载，归档为 10 个 <=100MB 的 tar 分片。
 
 Python >=3.9。首次运行缺少 SDK 时自动安装 cos-python-sdk-v5。
 凭据从 COS_SECRET_ID / COS_SECRET_KEY / COS_TOKEN 环境变量读取。
@@ -33,7 +33,7 @@ from typing import Any
 
 MB = 1_000_000  # MB，不是 MiB。
 WINDOW_BYTES = 990 * MB
-PART_COUNT = 30
+PART_COUNT = 10
 PART_MAX_BYTES = 100 * MB
 IO_CHUNK = 1024 * 1024
 SDK_REQUIREMENT = "cos-python-sdk-v5==1.9.44"
@@ -57,9 +57,7 @@ class ObjectInfo:
 
     @property
     def archive_path(self) -> str:
-        # 原始 key 可以包含 ../、绝对路径、中文、Windows 保留字符等。
-        # 用完整 key 的 SHA256 作为安全文件名，manifest.json 保存反向映射。
-        return "objects/" + hashlib.sha256(self.key.encode("utf-8")).hexdigest()
+        return self.key
 
     def tar_info(self) -> tarfile.TarInfo:
         info = tarfile.TarInfo(self.archive_path)
@@ -227,7 +225,7 @@ def download_window(
 
 
 class SplitTarWriter:
-    """将一个 tar 字节流均分为恰好 30 片，直接写入最终分片。"""
+    """将一个 tar 字节流均分为恰好 10 片，直接写入最终分片。"""
 
     def __init__(self, folder: Path, total_bytes: int, part_max: int):
         quotient, remainder = divmod(total_bytes, PART_COUNT)
@@ -422,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bucket", default=os.environ.get("COS_BUCKET"), help="存储桶名，含 APPID；也可设置 COS_BUCKET")
     parser.add_argument("--region", default=os.environ.get("COS_REGION"), help="如 ap-shanghai；也可设置 COS_REGION")
     parser.add_argument("--prefix", default="", help="仅收集此 key 前缀下的对象；默认整个桶")
-    parser.add_argument("--output-dir", type=Path, default=Path("cos_archives"), help="输出父目录，默认 ./cos_archives")
+    parser.add_argument("--output-dir", type=Path, default=Path("tmp"), help="输出父目录，默认 ./tmp")
     parser.add_argument("--temp-dir", type=Path, help="下载缓存和 SQLite 临时目录，默认系统临时目录")
     parser.add_argument("--max-folders", type=positive_int, default=10, help="本次运行最多创建的文件夹数量，默认 10")
     parser.add_argument("--window-mb", type=positive_int, default=990, help="对象原始字节窗口上限，1~990 MB，默认 990")

@@ -1,24 +1,69 @@
 #!/usr/bin/env bash
 # Upload a split tar directory to a public GitHub repository and enable Pages.
 # Usage: bash publish.sh DIRECTORY [OWNER]
+#        bash publish.sh --all [PARENT_DIRECTORY] [OWNER]
+# --all publishes every folder in PARENT_DIRECTORY (default: tmp) in turn.
 # Authentication: GH_TOKEN / GITHUB_TOKEN, or a hidden interactive PAT prompt.
 # Requires: Bash, git, gh, tar, mktemp; ssh for SSH uploads.
-# PUBLISH_GIT_PROTOCOL: https (default) or ssh (ssh.github.com:443).
-# The directory must contain archive.tar.part01..30.
+# PUBLISH_GIT_PROTOCOL: ssh (default, ssh.github.com:443) or https.
+# The directory must contain archive.tar.part01..10.
 # Upload dotfiles and ignored files, except .git, SUCCESS and obsolete metadata.
+# After a successful deployment, delete the local tar slices to free disk space.
 set +x
 set -Eeuo pipefail
 
 usage() {
   printf 'Usage: bash %s DIRECTORY [OWNER]\n' "${0##*/}"
-  printf 'Example: bash %s ./my-site my-organization\n' "${0##*/}"
-  printf 'SSH: PUBLISH_GIT_PROTOCOL=ssh bash %s DIRECTORY [OWNER]\n' "${0##*/}"
-  printf 'PUBLISH_GIT_PROTOCOL: https (default) or ssh (ssh.github.com:443).\n'
+  printf '       bash %s --all [PARENT_DIRECTORY] [OWNER]\n' "${0##*/}"
+  printf 'Example: bash %s ./tmp/UUID my-organization\n' "${0##*/}"
+  printf 'With --all, publish every folder in PARENT_DIRECTORY (default: tmp).\n'
+  printf 'PUBLISH_GIT_PROTOCOL: ssh (default, ssh.github.com:443) or https.\n'
 }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+read_token() {
+  # gh supports PAT authentication through GH_TOKEN without persisting a login.
+  export GH_HOST=github.com GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
+  export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [[ -z "$GH_TOKEN" ]]; then
+    [[ -t 0 ]] || die 'Set GH_TOKEN when running non-interactively.'
+    read -r -s -p 'GitHub PAT: ' GH_TOKEN
+    printf '\n'
+  fi
+  [[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
+}
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
+publish_all=0
+if [[ "${1:-}" == --all ]]; then
+  publish_all=1
+  shift
+  if (( $# == 0 )); then set -- tmp; fi
+fi
 [[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 1; }
 [[ -d "$1" ]] || die "Directory does not exist: $1"
+owner=${2:-}
+[[ -z "$owner" || "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'Invalid owner name.'
+
+if (( publish_all )); then
+  folders=()
+  for folder in "$1"/*/; do
+    if [[ -d "$folder" && ! -f "$folder/SUCCESS" ]]; then folders+=("${folder%/}"); fi
+  done
+  printf 'Unpublished folders in %s: %d\n' "$1" "${#folders[@]}"
+  (( ${#folders[@]} > 0 )) || exit 0
+  # Ask for the PAT once, then publish each folder with its own run of this script.
+  read_token
+  for index in "${!folders[@]}"; do
+    printf '\n[%d/%d] %s\n' "$((index + 1))" "${#folders[@]}" "${folders[index]}"
+    "$BASH" "$0" "${folders[index]}" ${owner:+"$owner"} || {
+      status=$?
+      printf 'Stopped at %s; run the same command again to resume.\n' "${folders[index]}" >&2
+      exit "$status"
+    }
+  done
+  printf '\nAll %d folders have been published.\n' "${#folders[@]}"
+  exit 0
+fi
+
 source_dir=$(cd -- "$1" && pwd -P)
 if [[ -f "$source_dir/SUCCESS" ]]; then
   printf 'Already published (SUCCESS exists), skipping: %s\n' "$source_dir"
@@ -30,15 +75,13 @@ done
 repo_name=${source_dir##*/}
 [[ "$repo_name" =~ ^[A-Za-z0-9._-]+$ && ${#repo_name} -le 100 && "$repo_name" != . && "$repo_name" != .. ]] ||
   die 'Folder name must be a valid repository name: 1-100 ASCII letters, digits, dots, underscores or hyphens.'
-for part in "$source_dir"/archive.tar.part{01..30}; do
+for part in "$source_dir"/archive.tar.part{01..10}; do
   [[ -f "$part" ]] || die "Missing tar slice: $part"
 done
-owner=${2:-}
-[[ -z "$owner" || "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'Invalid owner name.'
 
-git_protocol=${PUBLISH_GIT_PROTOCOL:-https}
-[[ "$git_protocol" == https || "$git_protocol" == ssh ]] ||
-  die 'PUBLISH_GIT_PROTOCOL must be https or ssh.'
+git_protocol=${PUBLISH_GIT_PROTOCOL:-ssh}
+[[ "$git_protocol" == ssh || "$git_protocol" == https ]] ||
+  die 'PUBLISH_GIT_PROTOCOL must be ssh or https.'
 if [[ "$git_protocol" == ssh ]]; then
   command -v ssh >/dev/null || die 'Missing dependency: ssh'
 fi
@@ -78,7 +121,7 @@ jobs:
       - name: Merge and extract tar slices into the repository root
         shell: bash
         run: |
-          parts=(archive.tar.part{01..30})
+          parts=(archive.tar.part{01..10})
           for part in "${parts[@]}"; do
             if [[ ! -f "$part" ]]; then
               printf 'Missing tar slice: %s\n' "$part" >&2
@@ -108,15 +151,7 @@ jobs:
 YAML
 [[ -f "$workflow_file" ]] || die 'The Pages workflow must be a regular file.'
 
-# gh supports PAT authentication through GH_TOKEN without persisting a login.
-export GH_HOST=github.com GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
-export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [[ -z "$GH_TOKEN" ]]; then
-  [[ -t 0 ]] || die 'Set GH_TOKEN when running non-interactively.'
-  read -r -s -p 'GitHub PAT: ' GH_TOKEN
-  printf '\n'
-fi
-[[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
+read_token
 push_attempt_limit=${PUBLISH_PUSH_ATTEMPTS:-8}
 push_low_speed_time=${PUBLISH_LOW_SPEED_TIME:-600}
 [[ "$push_attempt_limit" =~ ^[1-9][0-9]*$ && ${#push_attempt_limit} -le 2 && "$push_attempt_limit" -le 20 ]] ||
@@ -199,7 +234,7 @@ if [[ "$git_protocol" == https ]]; then
   printf 'Git settings: HTTP/1.1, adaptive buffer up to 128 MiB, low-speed timeout %ss.\n' "$push_low_speed_time"
 fi
 
-# Upload a copy; leave the source archive slices and Git history intact.
+# Upload a copy; keep the source slices until deployment succeeds and leave Git history intact.
 workdir=''
 created=0
 cleanup() {
@@ -289,12 +324,12 @@ other_files=()
 workflow_files=()
 while IFS= read -r -d '' file; do
   case "$file" in
-    archive.tar.part0[1-9]|archive.tar.part[12][0-9]|archive.tar.part30) ;;
+    archive.tar.part0[1-9]|archive.tar.part10) ;;
     .github/workflows/*) workflow_files+=("$file") ;;
     *) other_files+=("$file") ;;
   esac
 done < "$workdir/files.list"
-upload_files=(archive.tar.part{01..30} "${other_files[@]}" "${workflow_files[@]}")
+upload_files=(archive.tar.part{01..10} "${other_files[@]}" "${workflow_files[@]}")
 file_number=0
 for file in "${upload_files[@]}"; do
   file_number=$((file_number + 1))
@@ -335,7 +370,10 @@ for ((attempt=1; attempt<=180; attempt++)); do
   if [[ "$status" == completed ]]; then
     if [[ "$conclusion" == success ]]; then
       : > "$source_dir/SUCCESS"
+      # The slices are now stored in the repository; keep all other local files.
+      rm -f -- "$source_dir"/archive.tar.part{01..10}
       printf '\nDeployment complete!\nRepository: %s\nWebsite: %s\n' "$repo_url" "$site_url"
+      printf 'Deleted the local tar slices to free disk space.\n'
       exit 0
     fi
     die "Pages deployment failed ($conclusion): ${run_url:-$repo_url/actions}"
