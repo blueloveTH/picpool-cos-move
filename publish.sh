@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upload a split tar directory to a NEW public GitHub repository and enable Pages.
+# Upload a split tar directory to a public GitHub repository and enable Pages.
 # Usage: bash publish.sh DIRECTORY [OWNER]
 # Authentication: GH_TOKEN / GITHUB_TOKEN, or a hidden interactive PAT prompt.
 # Requires: Bash, git, gh, tar. The directory must contain archive.tar.part01..10.
@@ -161,19 +161,39 @@ git add --all --force
 git commit --quiet -m 'Publish static site'
 commit_sha=$(git rev-parse HEAD)
 
-# Creation fails if the name is already occupied; never overwrite another repo.
+# A failed deployment can be resumed only when the remote snapshot is identical.
+# Existing repository contents are never overwritten.
 printf 'Creating repository...\n'
-gh repo create "$repo" --public --description 'Static site hosted on GitHub Pages'
-created=1
+if gh repo create "$repo" --public --description 'Static site hosted on GitHub Pages' \
+    2>"$workdir/create-repo.log"; then
+  created=1
+else
+  if ! remote_commit=$(api "repos/$repo/commits/main" \
+      --jq '[.sha, .commit.tree.sha] | @tsv' 2>"$workdir/check-repo.log"); then
+    cat "$workdir/create-repo.log" "$workdir/check-repo.log" >&2
+    die 'Unable to create the repository or find a matching previous upload.'
+  fi
+  IFS=$'\t' read -r remote_sha remote_tree <<< "$remote_commit"
+  [[ -n "$remote_sha" && "$remote_tree" == "$(git rev-parse 'HEAD^{tree}')" ]] ||
+    die "Existing repository contents differ from this directory; kept unchanged: $repo_url"
+  commit_sha=$remote_sha
+  printf 'Found an identical previous upload; resuming deployment: %s\n' "$repo_url"
+fi
 git remote add origin "$repo_url.git"
-printf 'Uploading files...\n'
-# Clear inherited credential helpers; use this PAT for the Git HTTPS push too.
-git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-  push --set-upstream origin main
-# GitHub account defaults can use another default branch.
-api --method PATCH "repos/$repo" -f default_branch=main >/dev/null
+if (( created == 1 )); then
+  printf 'Uploading files...\n'
+  # Clear inherited credential helpers; use this PAT for the Git HTTPS push too.
+  git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+    push --set-upstream origin main
+  # GitHub account defaults can use another default branch.
+  api --method PATCH "repos/$repo" -f default_branch=main >/dev/null
+fi
 printf 'Enabling GitHub Pages through GitHub Actions...\n'
-api --method POST "repos/$repo/pages" --input - >/dev/null <<'JSON'
+pages_method=POST
+if (( created == 0 )) && api "repos/$repo/pages" >/dev/null 2>&1; then
+  pages_method=PUT
+fi
+api --method "$pages_method" "repos/$repo/pages" --input - >/dev/null <<'JSON'
 {"build_type":"workflow"}
 JSON
 # Dispatch after Pages is enabled; the initial push may run before setup finishes.
