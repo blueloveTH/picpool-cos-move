@@ -106,18 +106,57 @@ if [[ -z "$GH_TOKEN" ]]; then
   printf '\n'
 fi
 [[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
+push_attempt_limit=${PUBLISH_PUSH_ATTEMPTS:-8}
+push_low_speed_time=${PUBLISH_LOW_SPEED_TIME:-600}
+[[ "$push_attempt_limit" =~ ^[1-9][0-9]*$ && ${#push_attempt_limit} -le 2 && "$push_attempt_limit" -le 20 ]] ||
+  die 'PUBLISH_PUSH_ATTEMPTS must be an integer from 1 to 20.'
+[[ "$push_low_speed_time" =~ ^[1-9][0-9]*$ && ${#push_low_speed_time} -le 4 && "$push_low_speed_time" -le 3600 ]] ||
+  die 'PUBLISH_LOW_SPEED_TIME must be an integer from 1 to 3600 seconds.'
 api() { gh api --hostname github.com -H 'Accept: application/vnd.github+json' "$@"; }
-remote_git() { git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"; }
+remote_git() {
+  # Apply these settings to this process only, including inherited low-speed
+  # environment overrides. HTTP/1.1 avoids HTTP/2 issues on some proxy paths.
+  GIT_HTTP_MAX_REQUESTS=1 GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME="$push_low_speed_time" \
+    git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+      -c http.version=HTTP/1.1 -c http.maxRequests=1 \
+      -c http.lowSpeedLimit=1 -c "http.lowSpeedTime=$push_low_speed_time" \
+      -c pack.threads=1 -c pack.window=0 -c pack.compression=1 "$@"
+}
 push_commit() {
-  local description=$1 push_attempt
-  for ((push_attempt=1; push_attempt<=4; push_attempt++)); do
-    if remote_git push --set-upstream origin main; then return 0; fi
-    if (( push_attempt < 4 )); then
-      printf 'Push failed; retrying (%d/3) in 5 seconds...\n' "$push_attempt" >&2
-      sleep 5
+  local description=$1 data_bytes=${2:-0} push_attempt retry_delay
+  local post_buffer_bytes expected_sha remote_tip remote_sha remote_ref
+  # Each push adds one file. Buffer that file plus modest pack overhead, up to
+  # 128 MiB, to avoid chunked POSTs for slices without allocating a huge buffer
+  # for every small-file push. This helps proxies that mishandle chunked data.
+  post_buffer_bytes=$((data_bytes + 8 * 1024 * 1024))
+  if (( post_buffer_bytes > 128 * 1024 * 1024 )); then
+    post_buffer_bytes=$((128 * 1024 * 1024))
+  fi
+  expected_sha=$(git rev-parse HEAD)
+  for ((push_attempt=1; push_attempt<=push_attempt_limit; push_attempt++)); do
+    if remote_git -c "http.postBuffer=$post_buffer_bytes" \
+        push --progress --no-follow-tags --set-upstream origin HEAD:refs/heads/main; then
+      return 0
+    fi
+    # The server may accept a commit even when its response is lost. Confirm
+    # the exact commit before sending the same slice again.
+    if remote_tip=$(remote_git ls-remote --refs origin refs/heads/main \
+        2>"$workdir/check-push.log"); then
+      IFS=$'\t' read -r remote_sha remote_ref <<< "$remote_tip"
+      if [[ "$remote_sha" == "$expected_sha" && "$remote_ref" == refs/heads/main ]]; then
+        printf 'Server already received %s; continuing.\n' "$description"
+        return 0
+      fi
+    fi
+    if (( push_attempt < push_attempt_limit )); then
+      retry_delay=$((5 * (1 << (push_attempt - 1))))
+      if (( retry_delay > 60 )); then retry_delay=60; fi
+      printf 'Push failed (%d/%d); retrying %s in %d seconds...\n' \
+        "$push_attempt" "$push_attempt_limit" "$description" "$retry_delay" >&2
+      sleep "$retry_delay"
     fi
   done
-  die "Unable to push $description after 3 retries; run the same command again to resume."
+  die "Unable to push $description after $push_attempt_limit attempts; run the same command again to resume."
 }
 identity=$(api user --jq '[.login, (.id | tostring)] | @tsv')
 IFS=$'\t' read -r login user_id <<< "$identity"
@@ -126,6 +165,8 @@ owner=${owner:-$login}
 repo="$owner/$repo_name"
 repo_url="https://github.com/$repo"
 printf 'Account: %s\nPublic repository: %s\n' "$login" "$repo_url"
+printf 'Upload settings: HTTP/1.1, adaptive buffer up to 128 MiB, %s attempts, low-speed timeout %ss.\n' \
+  "$push_attempt_limit" "$push_low_speed_time"
 
 # Upload a copy; leave the source archive slices and Git history intact.
 workdir=''
@@ -235,7 +276,7 @@ for file in "${upload_files[@]}"; do
   # Suppress push-triggered builds while the upload is incomplete. The final
   # workflow_dispatch still runs after every file has been uploaded.
   git commit --quiet -m "Upload $file [skip ci]"
-  push_commit "$file"
+  push_commit "$file" "$(git cat-file -s "HEAD:$file")"
 done
 [[ "$(git rev-parse 'HEAD^{tree}')" == "$desired_tree" ]] ||
   die 'The uploaded snapshot does not match the source directory.'
