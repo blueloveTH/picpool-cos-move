@@ -126,6 +126,7 @@ printf 'Account: %s\nPublic repository: %s\n' "$login" "$repo_url"
 # Upload a copy; leave the source archive slices and Git history intact.
 workdir=''
 created=0
+upload_required=1
 cleanup() {
   result=$?
   trap - EXIT
@@ -161,26 +162,36 @@ git add --all --force
 git commit --quiet -m 'Publish static site'
 commit_sha=$(git rev-parse HEAD)
 
-# A failed deployment can be resumed only when the remote snapshot is identical.
+# Reuse an empty repository, or resume an identical previous upload.
 # Existing repository contents are never overwritten.
 printf 'Creating repository...\n'
 if gh repo create "$repo" --public --description 'Static site hosted on GitHub Pages' \
     2>"$workdir/create-repo.log"; then
   created=1
 else
-  if ! remote_commit=$(api "repos/$repo/commits/main" \
-      --jq '[.sha, .commit.tree.sha] | @tsv' 2>"$workdir/check-repo.log"); then
+  if ! remote_refs=$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+      ls-remote "$repo_url.git" 2>"$workdir/check-repo.log"); then
     cat "$workdir/create-repo.log" "$workdir/check-repo.log" >&2
-    die 'Unable to create the repository or find a matching previous upload.'
+    die 'Unable to create the repository or inspect its existing contents.'
   fi
-  IFS=$'\t' read -r remote_sha remote_tree <<< "$remote_commit"
-  [[ -n "$remote_sha" && "$remote_tree" == "$(git rev-parse 'HEAD^{tree}')" ]] ||
-    die "Existing repository contents differ from this directory; kept unchanged: $repo_url"
-  commit_sha=$remote_sha
-  printf 'Found an identical previous upload; resuming deployment: %s\n' "$repo_url"
+  if [[ -z "$remote_refs" ]]; then
+    printf 'Found an empty existing repository; continuing with upload: %s\n' "$repo_url"
+  else
+    if ! remote_commit=$(api "repos/$repo/commits/main" \
+        --jq '[.sha, .commit.tree.sha] | @tsv' 2>"$workdir/check-repo.log"); then
+      cat "$workdir/create-repo.log" "$workdir/check-repo.log" >&2
+      die 'Unable to find a matching previous upload in the existing repository.'
+    fi
+    IFS=$'\t' read -r remote_sha remote_tree <<< "$remote_commit"
+    [[ -n "$remote_sha" && "$remote_tree" == "$(git rev-parse 'HEAD^{tree}')" ]] ||
+      die "Existing repository contents differ from this directory; kept unchanged: $repo_url"
+    commit_sha=$remote_sha
+    upload_required=0
+    printf 'Found an identical previous upload; resuming deployment: %s\n' "$repo_url"
+  fi
 fi
 git remote add origin "$repo_url.git"
-if (( created == 1 )); then
+if (( upload_required == 1 )); then
   printf 'Uploading files...\n'
   # Clear inherited credential helpers; use this PAT for the Git HTTPS push too.
   git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \

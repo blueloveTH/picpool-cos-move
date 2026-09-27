@@ -117,3 +117,28 @@ objects/
 - 操作仅列举和读取 COS 当前对象，不收集历史版本，不执行上传或删除。归档存储对象需要已可读取，脚本不会自动恢复冷归档对象。
 
 本地已在当前工作目录的虚拟环境安装 `cos-python-sdk-v5==1.9.44`。16 项自动测试全部通过，另用真实腾讯 SDK 连接本地模拟 HTTP 服务，验证了 3 页对象列表、中文 key、时间排序、原始 gzip 字节下载、分片合并，以及 tar 根目录的 `meta.json` 和空 `.nojekyll`。依赖检查也通过。尚未连接实际 COS 桶；实际运行需要你提供环境变量和桶配置。
+
+## 发布到 GitHub Pages
+
+`publish.sh` 接收一个包含 `archive.tar.part01` 到 `archive.tar.part10` 的 UUID 文件夹，创建同名公开 GitHub 仓库，通过 GitHub Actions 构建和部署 Pages。需要 Bash、Git、GitHub CLI（`gh`）和 tar；本地文件夹不需要 `index.html`。
+
+```bash
+export GH_TOKEN='你的 GitHub PAT'
+bash publish.sh ./cos_archives/某个UUID文件夹
+# 可选：发布到指定账号或组织
+bash publish.sh ./cos_archives/某个UUID文件夹 my-organization
+```
+
+PAT 需要创建公开仓库、推送内容和工作流、管理 Pages 设置、触发及读取 Actions 的权限。使用 classic PAT 时，需要相应的仓库权限和 `workflow` scope。不提供环境变量时，脚本会在交互终端中隐藏输入 PAT。
+
+脚本自动在目标文件夹创建空 `.nojekyll` 和 `.github/workflows/deploy-pages.yml`；如果文件已存在，则保留内容和修改时间。工作流会按 `01` 到 `10` 的顺序合并 tar 切片，解压到仓库根目录，再创建内容为 `ok` 的根目录 `index.html` 和 `.nojekyll`。运行环境中的切片会在解压后移除，部署包只包含解压后的文件及其他站点文件，本地切片保持完整。
+
+Pages 使用 `build_type: workflow`，由 `configure-pages`、`upload-pages-artifact` 和 `deploy-pages` 部署，详情见 [GitHub 自定义 Pages 工作流文档](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。脚本启用 Pages 后触发工作流，最多等待 30 分钟，仅在当前提交的工作流部署成功后，在本地目标文件夹写入空 `SUCCESS` 标记。失败、取消或等待超时都不会生成该标记；再次执行时，如果已有 `SUCCESS`，会直接跳过，不需要凭据或发布工具。
+
+脚本默认创建新仓库。同名仓库已存在但尚无 Git 引用（空仓库）时，会直接继续推送，再启用 Pages 并触发工作流。非空仓库只有远程 `main` 的文件快照与本地上传内容完全一致，才会复用此前上传的提交并重新触发部署；内容不同则报错，不覆盖远程文件。工作流也支持推送到 `main` 或手动触发。
+
+本地回归验证（GitHub 操作使用模拟接口）：
+
+```bash
+python -m unittest discover -s tests -p test_publish.py -v
+```
