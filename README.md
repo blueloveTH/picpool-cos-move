@@ -133,12 +133,8 @@ PAT 需要创建公开仓库、推送内容和工作流、管理 Pages 设置、
 
 脚本自动在目标文件夹创建空 `.nojekyll` 和 `.github/workflows/deploy-pages.yml`；如果文件已存在，则保留内容和修改时间。工作流会按 `01` 到 `10` 的顺序合并 tar 切片，解压到仓库根目录，再创建内容为 `ok` 的根目录 `index.html` 和 `.nojekyll`。运行环境中的切片会在解压后移除，部署包只包含解压后的文件及其他站点文件，本地切片保持完整。
 
+上传时，每个文件单独提交并推送：先按顺序上传 10 个切片，再上传其他文件，最后上传 `.github/workflows/` 中的文件。单次推送失败后最多自动重试 3 次，每次间隔 5 秒。上传提交带有 `[skip ci]`，避免尚未上传完整时启动构建；所有文件上传完成后，脚本再手动触发部署工作流。参见 [GitHub 跳过工作流的说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs)。
+
 Pages 使用 `build_type: workflow`，由 `configure-pages`、`upload-pages-artifact` 和 `deploy-pages` 部署，详情见 [GitHub 自定义 Pages 工作流文档](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。脚本启用 Pages 后触发工作流，最多等待 30 分钟，仅在当前提交的工作流部署成功后，在本地目标文件夹写入空 `SUCCESS` 标记。失败、取消或等待超时都不会生成该标记；再次执行时，如果已有 `SUCCESS`，会直接跳过，不需要凭据或发布工具。
 
-脚本默认创建新仓库。同名仓库已存在但尚无 Git 引用（空仓库）时，会直接继续推送，再启用 Pages 并触发工作流。非空仓库只有远程 `main` 的文件快照与本地上传内容完全一致，才会复用此前上传的提交并重新触发部署；内容不同则报错，不覆盖远程文件。工作流也支持推送到 `main` 或手动触发。
-
-本地回归验证（GitHub 操作使用模拟接口）：
-
-```bash
-python -m unittest discover -s tests -p test_publish.py -v
-```
+脚本默认创建新仓库。同名仓库已存在但尚无 Git 引用（空仓库）时，会直接继续推送。已有部分文件时，脚本检查远程 `main`：已上传文件必须与本地对应文件一致，随后跳过这些文件，只继续上传缺少的文件。检查时仅获取提交和目录元数据，避免重新下载切片内容。若远程存在本地没有的文件或内容不同的文件，则报错，不覆盖远程文件。工作流也支持推送到 `main` 或手动触发。

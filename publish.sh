@@ -115,6 +115,7 @@ if [[ -z "$GH_TOKEN" ]]; then
 fi
 [[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
 api() { gh api --hostname github.com -H 'Accept: application/vnd.github+json' "$@"; }
+remote_git() { git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"; }
 identity=$(api user --jq '[.login, (.id | tostring)] | @tsv')
 IFS=$'\t' read -r login user_id <<< "$identity"
 [[ -n "$login" && -n "$user_id" ]] || die 'Unable to identify the authenticated user.'
@@ -126,13 +127,12 @@ printf 'Account: %s\nPublic repository: %s\n' "$login" "$repo_url"
 # Upload a copy; leave the source archive slices and Git history intact.
 workdir=''
 created=0
-upload_required=1
 cleanup() {
   result=$?
   trap - EXIT
   if (( result != 0 && created == 1 )); then
     printf 'The repository was created and has been kept: %s\n' "$repo_url" >&2
-    printf 'Inspect its contents and Pages settings before retrying.\n' >&2
+    printf 'Run the same command again to resume files already uploaded.\n' >&2
   fi
   if [[ -n "$workdir" && "$workdir" == "$temp_base"/gh-pages.* && -d "$workdir" ]]; then
     rm -rf -- "$workdir"
@@ -157,48 +157,86 @@ git config --local user.email "$user_id+$login@users.noreply.github.com"
 git config --local core.hooksPath /dev/null
 git config --local commit.gpgsign false
 git config --local core.autocrlf false
-# A deployment directory is a complete snapshot; include ignored build assets.
+# Record the desired snapshot, including ignored build assets, without committing
+# all files together. Only each file's own commit will be sent by its push.
 git add --all --force
-git commit --quiet -m 'Publish static site'
-commit_sha=$(git rev-parse HEAD)
+desired_tree=$(git write-tree)
+git ls-files -z > "$workdir/files.list"
+git read-tree --empty
+git remote add origin "$repo_url.git"
 
-# Reuse an empty repository, or resume an identical previous upload.
-# Existing repository contents are never overwritten.
+# Existing uploads may be a matching subset of the desired snapshot.
 printf 'Creating repository...\n'
 if gh repo create "$repo" --public --description 'Static site hosted on GitHub Pages' \
     2>"$workdir/create-repo.log"; then
   created=1
 else
-  if ! remote_refs=$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-      ls-remote "$repo_url.git" 2>"$workdir/check-repo.log"); then
+  if ! remote_refs=$(remote_git ls-remote origin 2>"$workdir/check-repo.log"); then
     cat "$workdir/create-repo.log" "$workdir/check-repo.log" >&2
     die 'Unable to create the repository or inspect its existing contents.'
   fi
   if [[ -z "$remote_refs" ]]; then
     printf 'Found an empty existing repository; continuing with upload: %s\n' "$repo_url"
   else
-    if ! remote_commit=$(api "repos/$repo/commits/main" \
-        --jq '[.sha, .commit.tree.sha] | @tsv' 2>"$workdir/check-repo.log"); then
-      cat "$workdir/create-repo.log" "$workdir/check-repo.log" >&2
-      die 'Unable to find a matching previous upload in the existing repository.'
-    fi
-    IFS=$'\t' read -r remote_sha remote_tree <<< "$remote_commit"
-    [[ -n "$remote_sha" && "$remote_tree" == "$(git rev-parse 'HEAD^{tree}')" ]] ||
-      die "Existing repository contents differ from this directory; kept unchanged: $repo_url"
-    commit_sha=$remote_sha
-    upload_required=0
-    printf 'Found an identical previous upload; resuming deployment: %s\n' "$repo_url"
+    has_main=0
+    while IFS=$'\t' read -r remote_sha remote_ref; do
+      if [[ "$remote_ref" == refs/heads/main ]]; then has_main=1; fi
+    done <<< "$remote_refs"
+    (( has_main == 1 )) || die "Existing repository has no main branch: $repo_url"
+    # Fetch commit/tree metadata without downloading the archive blobs again.
+    remote_git fetch --quiet --no-tags --depth=1 --filter=blob:none origin main
+    # From desired -> remote, deletions are files still awaiting upload. Added,
+    # modified, or differently typed files mean the repository does not match.
+    git diff-tree --quiet --no-renames -r --diff-filter=AMT "$desired_tree" FETCH_HEAD ||
+      die "Existing repository contains files that differ from this directory; kept unchanged: $repo_url"
+    git update-ref refs/heads/main "$(git rev-parse FETCH_HEAD)"
+    git read-tree HEAD
+    printf 'Resuming the existing upload; identical files will be skipped.\n'
   fi
 fi
-git remote add origin "$repo_url.git"
-if (( upload_required == 1 )); then
-  printf 'Uploading files...\n'
-  # Clear inherited credential helpers; use this PAT for the Git HTTPS push too.
-  git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-    push --set-upstream origin main
-  # GitHub account defaults can use another default branch.
-  api --method PATCH "repos/$repo" -f default_branch=main >/dev/null
-fi
+
+# Upload slices first, other files next, and workflows last. NUL-delimited paths
+# also support spaces and newlines in filenames.
+other_files=()
+workflow_files=()
+while IFS= read -r -d '' file; do
+  case "$file" in
+    archive.tar.part0[1-9]|archive.tar.part10) ;;
+    .github/workflows/*) workflow_files+=("$file") ;;
+    *) other_files+=("$file") ;;
+  esac
+done < "$workdir/files.list"
+upload_files=(archive.tar.part{01..10} "${other_files[@]}" "${workflow_files[@]}")
+file_number=0
+for file in "${upload_files[@]}"; do
+  file_number=$((file_number + 1))
+  git --literal-pathspecs add --force -- "$file"
+  if git --literal-pathspecs diff --cached --quiet -- "$file"; then
+    printf '[%d/%d] Already uploaded: %s\n' "$file_number" "${#upload_files[@]}" "$file"
+    continue
+  fi
+  printf '[%d/%d] Uploading: %s\n' "$file_number" "${#upload_files[@]}" "$file"
+  # Suppress push-triggered builds while the upload is incomplete. The final
+  # workflow_dispatch still runs after every file has been uploaded.
+  git commit --quiet -m "Upload $file [skip ci]"
+  pushed=0
+  for ((push_attempt=1; push_attempt<=4; push_attempt++)); do
+    if remote_git push --set-upstream origin main; then
+      pushed=1
+      break
+    fi
+    if (( push_attempt < 4 )); then
+      printf 'Push failed; retrying (%d/3) in 5 seconds...\n' "$push_attempt" >&2
+      sleep 5
+    fi
+  done
+  (( pushed == 1 )) || die "Unable to upload $file after 3 retries; run the same command again to resume."
+done
+[[ "$(git rev-parse 'HEAD^{tree}')" == "$desired_tree" ]] ||
+  die 'The uploaded snapshot does not match the source directory.'
+commit_sha=$(git rev-parse HEAD)
+# GitHub account defaults can use another default branch.
+api --method PATCH "repos/$repo" -f default_branch=main >/dev/null
 printf 'Enabling GitHub Pages through GitHub Actions...\n'
 pages_method=POST
 if (( created == 0 )) && api "repos/$repo/pages" >/dev/null 2>&1; then
@@ -207,7 +245,7 @@ fi
 api --method "$pages_method" "repos/$repo/pages" --input - >/dev/null <<'JSON'
 {"build_type":"workflow"}
 JSON
-# Dispatch after Pages is enabled; the initial push may run before setup finishes.
+# Dispatch only after all uploads are complete and Pages is enabled.
 api --method POST "repos/$repo/actions/workflows/$workflow_name/dispatches" \
   -f ref=main >/dev/null
 site_url=$(api "repos/$repo/pages" --jq '.html_url')
