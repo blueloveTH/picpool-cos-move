@@ -2,8 +2,8 @@
 # Upload a split tar directory to a public GitHub repository and enable Pages.
 # Usage: bash publish.sh DIRECTORY [OWNER]
 # Authentication: GH_TOKEN / GITHUB_TOKEN, or a hidden interactive PAT prompt.
-# Requires: Bash, git, gh, tar. The directory must contain archive.tar.part01..10.
-# All files (including dotfiles and ignored files) are uploaded, except .git and SUCCESS.
+# Requires: Bash, git, gh, tar. The directory must contain archive.tar.part01..30.
+# Upload dotfiles and ignored files, except .git, SUCCESS and obsolete metadata.
 set +x
 set -Eeuo pipefail
 
@@ -26,24 +26,18 @@ done
 repo_name=${source_dir##*/}
 [[ "$repo_name" =~ ^[A-Za-z0-9._-]+$ && ${#repo_name} -le 100 && "$repo_name" != . && "$repo_name" != .. ]] ||
   die 'Folder name must be a valid repository name: 1-100 ASCII letters, digits, dots, underscores or hyphens.'
-for part in "$source_dir"/archive.tar.part{01..10}; do
+for part in "$source_dir"/archive.tar.part{01..30}; do
   [[ -f "$part" ]] || die "Missing tar slice: $part"
 done
 owner=${2:-}
 [[ -z "$owner" || "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die 'Invalid owner name.'
 
-# Keep generated files in the source directory so retries can reuse them.
-[[ ! -L "$source_dir/.nojekyll" ]] || die '.nojekyll must not be a symbolic link.'
-if [[ ! -e "$source_dir/.nojekyll" ]]; then
-  : > "$source_dir/.nojekyll"
-fi
-[[ -f "$source_dir/.nojekyll" ]] || die '.nojekyll must be a regular file.'
+# Always replace the managed workflow so the current archive format takes effect.
 workflow_name=deploy-pages.yml
 workflow_file="$source_dir/.github/workflows/$workflow_name"
 mkdir -p -- "${workflow_file%/*}"
 [[ ! -L "$workflow_file" ]] || die 'The Pages workflow must not be a symbolic link.'
-if [[ ! -e "$workflow_file" ]]; then
-  cat > "$workflow_file" <<'YAML'
+cat > "$workflow_file" <<'YAML'
 name: Deploy archive to GitHub Pages
 
 on:
@@ -73,7 +67,7 @@ jobs:
       - name: Merge and extract tar slices into the repository root
         shell: bash
         run: |
-          parts=(archive.tar.part{01..10})
+          parts=(archive.tar.part{01..30})
           for part in "${parts[@]}"; do
             if [[ ! -f "$part" ]]; then
               printf 'Missing tar slice: %s\n' "$part" >&2
@@ -84,11 +78,10 @@ jobs:
           # Upload the extracted files without duplicating the archive payload.
           rm -- "${parts[@]}"
 
-      - name: Create the status page and disable Jekyll
+      - name: Create the status page
         shell: bash
         run: |
           printf 'ok\n' > index.html
-          touch .nojekyll
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -102,7 +95,6 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 YAML
-fi
 [[ -f "$workflow_file" ]] || die 'The Pages workflow must be a regular file.'
 
 # gh supports PAT authentication through GH_TOKEN without persisting a login.
@@ -116,6 +108,17 @@ fi
 [[ -n "$GH_TOKEN" ]] || die 'PAT must not be empty.'
 api() { gh api --hostname github.com -H 'Accept: application/vnd.github+json' "$@"; }
 remote_git() { git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"; }
+push_commit() {
+  local description=$1 push_attempt
+  for ((push_attempt=1; push_attempt<=4; push_attempt++)); do
+    if remote_git push --set-upstream origin main; then return 0; fi
+    if (( push_attempt < 4 )); then
+      printf 'Push failed; retrying (%d/3) in 5 seconds...\n' "$push_attempt" >&2
+      sleep 5
+    fi
+  done
+  die "Unable to push $description after 3 retries; run the same command again to resume."
+}
 identity=$(api user --jq '[.login, (.id | tostring)] | @tsv')
 IFS=$'\t' read -r login user_id <<< "$identity"
 [[ -n "$login" && -n "$user_id" ]] || die 'Unable to identify the authenticated user.'
@@ -144,7 +147,8 @@ temp_base=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
 trap cleanup EXIT
 workdir=$(mktemp -d "$temp_base/gh-pages.XXXXXXXX")
 mkdir "$workdir/site"
-tar -C "$source_dir" --exclude='.git' --exclude='./SUCCESS' -cf - . | tar -C "$workdir/site" -xf -
+tar -C "$source_dir" --exclude='.git' --exclude='./SUCCESS' \
+  --exclude='./.nojekyll' --exclude='./meta.json' -cf - . | tar -C "$workdir/site" -xf -
 cd "$workdir/site"
 # Avoid inheriting an enclosing repository, hooks, or a configured Git template.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
@@ -186,12 +190,24 @@ else
     # Fetch commit/tree metadata without downloading the archive blobs again.
     remote_git fetch --quiet --no-tags --depth=1 --filter=blob:none origin main
     # From desired -> remote, deletions are files still awaiting upload. Added,
-    # modified, or differently typed files mean the repository does not match.
-    git diff-tree --quiet --no-renames -r --diff-filter=AMT "$desired_tree" FETCH_HEAD ||
+    # modified, or differently typed data files mean the repository does not
+    # match. The managed workflow and obsolete metadata can be updated.
+    git --no-literal-pathspecs diff-tree --quiet --no-renames -r --diff-filter=AMT \
+      "$desired_tree" FETCH_HEAD -- . ":(top,exclude,literal).github/workflows/$workflow_name" \
+      ':(top,exclude,literal).nojekyll' ':(top,exclude,literal)meta.json' ||
       die "Existing repository contains files that differ from this directory; kept unchanged: $repo_url"
     git update-ref refs/heads/main "$(git rev-parse FETCH_HEAD)"
     git read-tree HEAD
     printf 'Resuming the existing upload; identical files will be skipped.\n'
+  fi
+fi
+
+# Remove files generated by older versions from an existing remote snapshot.
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  git --literal-pathspecs rm --quiet --cached --ignore-unmatch -- .nojekyll meta.json
+  if ! git diff --cached --quiet; then
+    git commit --quiet -m 'Remove obsolete archive metadata [skip ci]'
+    push_commit 'obsolete metadata removal'
   fi
 fi
 
@@ -201,12 +217,12 @@ other_files=()
 workflow_files=()
 while IFS= read -r -d '' file; do
   case "$file" in
-    archive.tar.part0[1-9]|archive.tar.part10) ;;
+    archive.tar.part0[1-9]|archive.tar.part[12][0-9]|archive.tar.part30) ;;
     .github/workflows/*) workflow_files+=("$file") ;;
     *) other_files+=("$file") ;;
   esac
 done < "$workdir/files.list"
-upload_files=(archive.tar.part{01..10} "${other_files[@]}" "${workflow_files[@]}")
+upload_files=(archive.tar.part{01..30} "${other_files[@]}" "${workflow_files[@]}")
 file_number=0
 for file in "${upload_files[@]}"; do
   file_number=$((file_number + 1))
@@ -219,18 +235,7 @@ for file in "${upload_files[@]}"; do
   # Suppress push-triggered builds while the upload is incomplete. The final
   # workflow_dispatch still runs after every file has been uploaded.
   git commit --quiet -m "Upload $file [skip ci]"
-  pushed=0
-  for ((push_attempt=1; push_attempt<=4; push_attempt++)); do
-    if remote_git push --set-upstream origin main; then
-      pushed=1
-      break
-    fi
-    if (( push_attempt < 4 )); then
-      printf 'Push failed; retrying (%d/3) in 5 seconds...\n' "$push_attempt" >&2
-      sleep 5
-    fi
-  done
-  (( pushed == 1 )) || die "Unable to upload $file after 3 retries; run the same command again to resume."
+  push_commit "$file"
 done
 [[ "$(git rev-parse 'HEAD^{tree}')" == "$desired_tree" ]] ||
   die 'The uploaded snapshot does not match the source directory.'

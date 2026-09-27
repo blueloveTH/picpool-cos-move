@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按 COS LastModified 分窗口并发下载，归档为 10 个 <=100MB 的 tar 分片。
+"""按 COS LastModified 分窗口并发下载，归档为 30 个 <=100MB 的 tar 分片。
 
 Python >=3.9。首次运行缺少 SDK 时自动安装 cos-python-sdk-v5。
 凭据从 COS_SECRET_ID / COS_SECRET_KEY / COS_TOKEN 环境变量读取。
@@ -13,7 +13,6 @@ import argparse
 import errno
 import hashlib
 import importlib.util
-import io
 import json
 import logging
 import os
@@ -34,7 +33,7 @@ from typing import Any
 
 MB = 1_000_000  # MB，不是 MiB。
 WINDOW_BYTES = 990 * MB
-PART_COUNT = 10
+PART_COUNT = 30
 PART_MAX_BYTES = 100 * MB
 IO_CHUNK = 1024 * 1024
 SDK_REQUIREMENT = "cos-python-sdk-v5==1.9.44"
@@ -74,13 +73,6 @@ class ObjectInfo:
         header = self.tar_info().tobuf(format=tarfile.USTAR_FORMAT)
         return len(header) + round_up(self.size, tarfile.BLOCKSIZE)
 
-    def meta_entry_bytes(self) -> int:
-        # 与 json.dumps(..., ensure_ascii=False, indent=2) 的 UTF-8 字节数一致。
-        key = json.dumps(self.key, ensure_ascii=False).encode("utf-8")
-        modified = json.dumps(self.last_modified, ensure_ascii=False).encode("utf-8")
-        return 6 + len(key) + len(modified)
-
-
 @dataclass(frozen=True)
 class Downloaded:
     obj: ObjectInfo
@@ -92,11 +84,9 @@ def round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def archive_bytes(member_bytes: int, meta_size: int = 3) -> int:
-    # tar 根目录 meta.json（含内容）、空 .nojekyll 的头、两个结束块，
-    # 并补齐 tarfile 的 10240 字节记录。
-    root_files = 2 * tarfile.BLOCKSIZE + round_up(meta_size, tarfile.BLOCKSIZE)
-    return round_up(member_bytes + root_files + 2 * tarfile.BLOCKSIZE, tarfile.RECORDSIZE)
+def archive_bytes(member_bytes: int) -> int:
+    # 对象的头和内容、两个结束块，并补齐 tarfile 的 10240 字节记录。
+    return round_up(member_bytes + 2 * tarfile.BLOCKSIZE, tarfile.RECORDSIZE)
 
 
 def collect_objects(client: Any, bucket: str, prefix: str, db: sqlite3.Connection) -> int:
@@ -237,13 +227,13 @@ def download_window(
 
 
 class SplitTarWriter:
-    """将一个 tar 字节流均分为恰好 10 片，直接写入最终分片。"""
+    """将一个 tar 字节流均分为恰好 30 片，直接写入最终分片。"""
 
     def __init__(self, folder: Path, total_bytes: int, part_max: int):
         quotient, remainder = divmod(total_bytes, PART_COUNT)
         self.lengths = [quotient + (i < remainder) for i in range(PART_COUNT)]
         if min(self.lengths) <= 0 or max(self.lengths) > part_max:
-            raise ValueError("tar 总大小无法分为 10 个符合大小限制的非空分片")
+            raise ValueError(f"tar 总大小无法分为 {PART_COUNT} 个符合大小限制的非空分片")
         self.folder = folder
         self.expected = total_bytes
         self.written = 0
@@ -304,9 +294,7 @@ def publish_window(
     items: list[Downloaded], output_dir: Path, bucket: str,
     window_limit: int, part_max: int,
 ) -> Path:
-    meta = {item.obj.key: item.obj.last_modified for item in items}
-    meta_content = (json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    total_bytes = archive_bytes(sum(item.obj.tar_bytes() for item in items), len(meta_content))
+    total_bytes = archive_bytes(sum(item.obj.tar_bytes() for item in items))
     folder_id = str(uuid.uuid4())
     # 全部完成后才改名为 UUID 文件夹；失败不会留下看似完整的结果。
     with tempfile.TemporaryDirectory(prefix=".cos-pending-", dir=output_dir) as pending:
@@ -316,19 +304,11 @@ def publish_window(
                 mode="w|", fileobj=writer, format=tarfile.USTAR_FORMAT,
                 bufsize=IO_CHUNK, copybufsize=IO_CHUNK,
             ) as archive:
-                meta_info = tarfile.TarInfo("meta.json")
-                meta_info.size = len(meta_content)
-                meta_info.mode = 0o644
-                archive.addfile(meta_info, io.BytesIO(meta_content))
-                nojekyll_info = tarfile.TarInfo(".nojekyll")
-                nojekyll_info.mode = 0o644
-                archive.addfile(nojekyll_info)
                 for item in items:
                     with item.path.open("rb") as source:
                         archive.addfile(item.obj.tar_info(), source)
             writer.verify()
             parts = writer.parts
-        (staging / "meta.json").write_bytes(meta_content)
         write_json(staging / "manifest.json", {
             "format": "tar-byte-split-v1",
             "folder_id": folder_id,
@@ -339,7 +319,8 @@ def publish_window(
             "window_limit_bytes": window_limit,
             "payload_bytes": sum(item.obj.size for item in items),
             "tar_bytes": total_bytes,
-            "tar_root_files": ["meta.json", ".nojekyll"],
+            "tar_root_files": [],
+            "part_count": PART_COUNT,
             "part_max_bytes": part_max,
             "parts": parts,
             "objects": [{
@@ -378,10 +359,9 @@ def export_bucket(
             window: list[tuple[ObjectInfo, Path]] = []
             payload = 0
             tar_members = 0
-            meta_size = 3  # 空 JSON 映射与结尾换行。
 
             def flush() -> None:
-                nonlocal payload, tar_members, meta_size
+                nonlocal payload, tar_members
                 LOG.info("下载窗口 %d：%d 个对象，%.3f MB，并发数 %d",
                          len(completed) + 1, len(window), payload / MB, workers)
                 downloaded_items = download_window(
@@ -396,7 +376,6 @@ def export_bucket(
                 window.clear()
                 payload = 0
                 tar_members = 0
-                meta_size = 3
 
             # 显式关闭尚未读完的游标，Windows 才能在提前返回时删除 SQLite 文件。
             with closing(db.execute(
@@ -405,14 +384,13 @@ def export_bucket(
                 for index, row in enumerate(rows):
                     obj = ObjectInfo(*row)
                     cost = obj.tar_bytes()
-                    meta_cost = obj.meta_entry_bytes()
                     # 先结束上一窗口，再决定是否处理当前对象。到达上限时不下载下一对象。
                     if window and (payload + obj.size > window_limit or
-                                   archive_bytes(tar_members + cost, meta_size + meta_cost) > PART_COUNT * part_max):
+                                   archive_bytes(tar_members + cost) > PART_COUNT * part_max):
                         flush()
                         if len(completed) >= max_folders:
                             return completed
-                    if obj.size > window_limit or archive_bytes(cost, 3 + meta_cost) > PART_COUNT * part_max:
+                    if obj.size > window_limit or archive_bytes(cost) > PART_COUNT * part_max:
                         message = f"对象 {obj.key!r}（{obj.size} 字节）无法装入一个窗口"
                         if skip_oversized:
                             LOG.warning("%s，按 --skip-oversized 跳过", message)
@@ -422,8 +400,7 @@ def export_bucket(
                     window.append((obj, scratch_path / f"object-{index:012d}"))
                     payload += obj.size
                     tar_members += cost
-                    meta_size += meta_cost
-                    if payload == window_limit or archive_bytes(tar_members, meta_size) == PART_COUNT * part_max:
+                    if payload == window_limit or archive_bytes(tar_members) == PART_COUNT * part_max:
                         flush()
                         if len(completed) >= max_folders:
                             return completed
