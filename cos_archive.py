@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """按 COS LastModified 分窗口并发下载，归档为 10 个 <=100MB 的 tar 分片。
 
+输出目录中已有文件夹的 manifest.json 记录的 key 视为已归档，自动跳过。
 Python >=3.9。首次运行缺少 SDK 时自动安装 cos-python-sdk-v5。
 凭据从 COS_SECRET_ID / COS_SECRET_KEY / COS_TOKEN 环境变量读取。
 示例：python cos_archive.py --bucket example-1250000000 --region ap-shanghai
@@ -125,6 +126,48 @@ def collect_objects(client: Any, bucket: str, prefix: str, db: sqlite3.Connectio
     db.execute("CREATE INDEX objects_by_time ON objects(sort_time, key)")
     db.commit()
     return count
+
+
+def archived_manifests(output_dir: Path) -> list[Path]:
+    """列出输出目录中已有文件夹的清单；与 publish.sh --all 一样忽略以 . 开头的目录。"""
+    if not output_dir.is_dir():
+        return []
+    manifests = []
+    for folder in sorted(output_dir.iterdir()):
+        # .cos-pending-* 是中断后未改名的暂存目录，其中的对象不算已归档。
+        if folder.name.startswith(".") or not folder.is_dir():
+            continue
+        manifest = folder / "manifest.json"
+        if not manifest.is_file():
+            raise RuntimeError(
+                f"{folder} 缺少 manifest.json，无法确认其中已归档的 key；"
+                "publish.sh --all 也会把它当作待发布文件夹，请移出输出目录后重试"
+            )
+        manifests.append(manifest)
+    return manifests
+
+
+def load_archived_keys(manifests: list[Path], bucket: str, db: sqlite3.Connection) -> int:
+    """把同一存储桶已归档的 key 存入 SQLite，返回去重后的数量。"""
+    db.execute("CREATE TABLE archived (key TEXT PRIMARY KEY)")
+    for path in manifests:
+        try:
+            with path.open(encoding="utf-8") as file:
+                manifest = json.load(file)
+            if manifest["format"] != "tar-byte-split-v1":
+                raise ValueError(f"未知的清单格式 {manifest['format']!r}")
+            manifest_bucket = manifest["bucket"]
+            keys = [item["id"] for item in manifest["objects"]]
+            if not all(isinstance(key, str) and key for key in keys):
+                raise ValueError("objects[].id 必须是非空字符串")
+        except (OSError, ValueError, LookupError, TypeError) as exc:
+            raise RuntimeError(f"无法读取已有清单 {path}：{exc!r}") from exc
+        if manifest_bucket != bucket:
+            LOG.info("%s 属于存储桶 %r，其中的 key 不跳过", path.parent.name, manifest_bucket)
+            continue
+        db.executemany("INSERT OR IGNORE INTO archived VALUES (?)", ((key,) for key in keys))
+    db.commit()
+    return db.execute("SELECT COUNT(*) FROM archived").fetchone()[0]
 
 
 def download_object(
@@ -346,14 +389,24 @@ def export_bucket(
         raise ValueError("数量、大小限制、尝试次数和并发数必须为正数")
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
+    # 在创建本次缓存目录前列出；--temp-dir 与输出目录相同时不会把缓存当作归档文件夹。
+    manifests = archived_manifests(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     completed: list[Path] = []
     with tempfile.TemporaryDirectory(prefix="cos-download-", dir=temp_dir) as scratch:
         scratch_path = Path(scratch)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cos-download") as executor, \
                 closing(sqlite3.connect(scratch_path / "index.sqlite3")) as db:
+            archived = load_archived_keys(manifests, bucket, db)
+            LOG.info("输出目录已有 %d 个文件夹，记录了 %d 个本存储桶已归档的 key",
+                     len(manifests), archived)
             count = collect_objects(client, bucket, prefix, db)
-            LOG.info("收集完成：%d 个对象，按时间分窗口，并发下载数 %d", count, workers)
+            skipped = db.execute(
+                "DELETE FROM objects WHERE key IN (SELECT key FROM archived)"
+            ).rowcount
+            db.commit()
+            LOG.info("收集完成：%d 个对象，跳过已归档的 %d 个；按时间分窗口，并发下载数 %d",
+                     count, skipped, workers)
             window: list[tuple[ObjectInfo, Path]] = []
             payload = 0
             tar_members = 0
@@ -420,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bucket", default=os.environ.get("COS_BUCKET"), help="存储桶名，含 APPID；也可设置 COS_BUCKET")
     parser.add_argument("--region", default=os.environ.get("COS_REGION"), help="如 ap-shanghai；也可设置 COS_REGION")
     parser.add_argument("--prefix", default="", help="仅收集此 key 前缀下的对象；默认整个桶")
-    parser.add_argument("--output-dir", type=Path, default=Path("tmp"), help="输出父目录，默认 ./tmp")
+    parser.add_argument("--output-dir", type=Path, default=Path("tmp"), help="输出父目录，默认 ./tmp；跳过其中已有文件夹清单记录的 key")
     parser.add_argument("--temp-dir", type=Path, help="下载缓存和 SQLite 临时目录，默认系统临时目录")
     parser.add_argument("--max-folders", type=positive_int, default=10, help="本次运行最多创建的文件夹数量，默认 10")
     parser.add_argument("--window-mb", type=positive_int, default=990, help="对象原始字节窗口上限，1~990 MB，默认 990")
