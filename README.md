@@ -63,20 +63,26 @@ tmp/
     └── manifest.json
 ```
 
-`manifest.json` 的 `objects` 数组保存完整 COS key、tar 中的文件路径、大小、原始 LastModified、ETag 和对象 SHA256。例如，其中的对象记录如下：
+`manifest.json` 的 `objects` 数组只保存完整 COS key、大小和原始 LastModified，不再写入 `archive_path`、`etag` 和对象 `sha256`。例如，其中的对象记录如下：
 
 ```json
 {
   "id": "images/a.jpg",
-  "archive_path": "images/a.jpg",
   "size": 1234,
-  "last_modified": "2026-09-01T08:00:00.000Z",
-  "etag": "<COS ETag>",
-  "sha256": "<对象内容的 SHA256>"
+  "last_modified": "2026-09-01T08:00:00.000Z"
 }
 ```
 
-tar 内文件路径直接使用完整 COS key，不加前缀，也不做转换，因此 `archive_path` 与 `id` 相同。`manifest.json` 的 `part_count` 为 10，`parts` 数组按顺序保存每个分片的名称、大小和 SHA256。清单位于 UUID 文件夹中，不写入 tar；tar 中没有额外的根目录文件，`tar_root_files` 为空数组。
+tar 内文件路径直接使用完整 COS key，不加前缀，也不做转换，与 `id` 相同。`manifest.json` 的 `part_count` 为 10，`parts` 数组按顺序保存每个分片的名称、大小和 SHA256。清单位于 UUID 文件夹中，不写入 tar；tar 中没有额外的根目录文件，`tar_root_files` 为空数组。
+
+已有清单可用 `cleanup_manifests.py` 批量精简。脚本默认处理 `./tmp/*/manifest.json`，移除 `objects` 中的上述三个字段，同时删除清单所在目录的 `.github` 文件夹，保留分片、`SUCCESS` 标记、对象顺序和其他清单信息（包括分片 SHA256）。以 `.` 开头的暂存目录会被跳过；清单通过同目录临时文件原子替换，可重复执行。
+
+```bash
+python cleanup_manifests.py --dry-run
+python cleanup_manifests.py
+# 指定其他归档父目录
+python cleanup_manifests.py --output-dir ./other-tmp
+```
 
 这些是**一个 tar 的 10 个字节分片**，单片不能独立解压。按 `part01` 到 `part10` 顺序合并后才是完整 tar。
 
@@ -116,7 +122,7 @@ images/
 - 网络读取和 tar 拷贝缓冲为 1MiB；对象内容不会把 990MB 全部放到内存。对象清单在磁盘 SQLite 中排序，当前窗口的元数据仍占用内存。
 - 下载缓存最多约 990MB，另有 SQLite 索引；不另写整份中间 tar，直接生成分片。`--temp-dir` 可指定缓存所在磁盘。每个窗口 tar 总大小最多 10×100MB，默认最多创建 10 个文件夹，输出磁盘最多约 10GB tar 数据，另外需要清单空间。
 - 文件夹完整写好后才改名为 UUID；中途出错时保留此前完成的文件夹，删除本次尚未完成的缓存。重新运行会重新列举整个桶，跳过输出目录中已有文件夹记录的 key，从最早的未归档对象继续，产生新的 UUID 文件夹；中断时未完成的窗口会重新下载。
-- 是否跳过只按 key 判断：已归档的 key 之后在 COS 中被覆盖，也不会重新归档，站点保留归档时的内容。发布后请把 UUID 文件夹留在输出目录中（`publish.sh` 只删除切片，保留 `manifest.json`）；删除或移走文件夹后，其中的 key 会在下次运行时重新归档。换用其他 `--output-dir` 时，只跳过该目录中记录的 key。
+- 是否跳过只按 key 判断：已归档的 key 之后在 COS 中被覆盖，也不会重新归档，站点保留归档时的内容。发布后请把 UUID 文件夹留在输出目录中（`publish.sh` 删除切片和 `.github`，保留 `manifest.json` 与 `SUCCESS`）；删除或移走文件夹后，其中的 key 会在下次运行时重新归档。换用其他 `--output-dir` 时，只跳过该目录中记录的 key。
 - 操作仅列举和读取 COS 当前对象，不收集历史版本，不执行上传或删除。归档存储对象需要已可读取，脚本不会自动恢复冷归档对象。
 
 ## 发布到 GitHub Pages
@@ -170,6 +176,6 @@ export PUBLISH_LOW_SPEED_TIME=900    # 1～3600 秒，默认 600，仅 HTTPS 模
 bash publish.sh ./tmp/某个UUID文件夹
 ```
 
-Pages 使用 `build_type: workflow`，由 `configure-pages`、`upload-pages-artifact` 和 `deploy-pages` 部署，详情见 [GitHub 自定义 Pages 工作流文档](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。脚本启用 Pages 后触发工作流，最多等待 30 分钟，仅在当前提交的工作流部署成功后，在本地目标文件夹写入空 `SUCCESS` 标记，并删除本地的 `archive.tar.part01` 到 `archive.tar.part10` 以释放空间，`manifest.json` 等其他文件保留。失败、取消或等待超时都不会生成该标记，也不会删除切片，重新执行即可接续；再次执行时，如果已有 `SUCCESS`，会直接跳过，不需要凭据或发布工具。
+Pages 使用 `build_type: workflow`，由 `configure-pages`、`upload-pages-artifact` 和 `deploy-pages` 部署，详情见 [GitHub 自定义 Pages 工作流文档](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。脚本启用 Pages 后触发工作流，最多等待 30 分钟，仅在当前提交的工作流部署成功后，在本地目标文件夹写入空 `SUCCESS` 标记，并删除本地的 `archive.tar.part01` 到 `archive.tar.part10` 和 `.github` 文件夹以释放空间，标准归档目录中只留下 `manifest.json` 与 `SUCCESS`。失败、取消或等待超时都不会生成该标记，也不会删除切片或 `.github`，重新执行即可接续；再次执行时，如果已有 `SUCCESS`，会直接跳过，不需要凭据或发布工具。
 
 脚本默认创建新仓库。同名仓库已存在但尚无 Git 引用（空仓库）时，会直接继续推送。已有部分文件时，脚本检查远程 `main`：已上传的数据文件必须与本地对应文件一致，随后跳过这些文件，只继续上传缺少的文件。脚本生成的 `deploy-pages.yml` 允许替换为当前模板；本地旧的根目录 `meta.json` 和 `.nojekyll` 不再上传，远程的对应旧文件会被清理。检查时仅获取提交和目录元数据，避免重新下载切片内容。其他远程文件缺少本地对应文件或内容不同，则报错，不覆盖这些文件。工作流也支持推送到 `main` 或手动触发。

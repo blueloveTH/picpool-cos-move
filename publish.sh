@@ -8,7 +8,7 @@
 # PUBLISH_GIT_PROTOCOL: ssh (default, ssh.github.com:443) or https.
 # The directory must contain archive.tar.part01..10.
 # Upload dotfiles and ignored files, except .git, SUCCESS and obsolete metadata.
-# After a successful deployment, delete the local tar slices to free disk space.
+# After a successful deployment, delete local tar slices and the .github directory.
 set +x
 set -Eeuo pipefail
 
@@ -370,10 +370,11 @@ for ((attempt=1; attempt<=180; attempt++)); do
   if [[ "$status" == completed ]]; then
     if [[ "$conclusion" == success ]]; then
       : > "$source_dir/SUCCESS"
-      # The slices are now stored in the repository; keep all other local files.
+      # The slices and workflow are stored remotely; keep manifest.json and SUCCESS.
       rm -f -- "$source_dir"/archive.tar.part{01..10}
+      rm -rf -- "$source_dir/.github"
       printf '\nDeployment complete!\nRepository: %s\nWebsite: %s\n' "$repo_url" "$site_url"
-      printf 'Deleted the local tar slices to free disk space.\n'
+      printf 'Deleted the local tar slices and .github directory; kept manifest.json and SUCCESS.\n'
       exit 0
     fi
     die "Pages deployment failed ($conclusion): ${run_url:-$repo_url/actions}"

@@ -366,11 +366,8 @@ def publish_window(
             "parts": parts,
             "objects": [{
                 "id": item.obj.key,
-                "archive_path": item.obj.archive_path,
                 "size": item.obj.size,
                 "last_modified": item.obj.last_modified,
-                "etag": item.obj.etag,
-                "sha256": item.sha256,
             } for item in items],
         })
         final = output_dir / folder_id
