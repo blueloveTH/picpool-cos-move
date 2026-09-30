@@ -179,3 +179,19 @@ bash publish.sh ./tmp/某个UUID文件夹
 Pages 使用 `build_type: workflow`，由 `configure-pages`、`upload-pages-artifact` 和 `deploy-pages` 部署，详情见 [GitHub 自定义 Pages 工作流文档](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。脚本启用 Pages 后触发工作流，最多等待 30 分钟，仅在当前提交的工作流部署成功后，在本地目标文件夹写入空 `SUCCESS` 标记，并删除本地的 `archive.tar.part01` 到 `archive.tar.part10` 和 `.github` 文件夹以释放空间，标准归档目录中只留下 `manifest.json` 与 `SUCCESS`。失败、取消或等待超时都不会生成该标记，也不会删除切片或 `.github`，重新执行即可接续；再次执行时，如果已有 `SUCCESS`，会直接跳过，不需要凭据或发布工具。
 
 脚本默认创建新仓库。同名仓库已存在但尚无 Git 引用（空仓库）时，会直接继续推送。已有部分文件时，脚本检查远程 `main`：已上传的数据文件必须与本地对应文件一致，随后跳过这些文件，只继续上传缺少的文件。脚本生成的 `deploy-pages.yml` 允许替换为当前模板；本地旧的根目录 `meta.json` 和 `.nojekyll` 不再上传，远程的对应旧文件会被清理。检查时仅获取提交和目录元数据，避免重新下载切片内容。其他远程文件缺少本地对应文件或内容不同，则报错，不覆盖这些文件。工作流也支持推送到 `main` 或手动触发。
+
+## 从 COS 删除已发布的对象
+
+`cos_delete.py` 读取归档父目录（默认 `./tmp`）中各文件夹 `manifest.json` 的 `objects[].id`，通过 COS 批量删除接口并发删除这些对象。凭据、`--bucket`、`--region` 的用法与 `cos_archive.py` 相同，缺少 SDK 时同样自动安装；密钥需要列举存储桶和删除对象的权限。删除无法撤销，建议先用 `--dry-run` 预览：
+
+```bash
+python cos_delete.py --bucket example-1250000000 --region ap-shanghai --dry-run
+python cos_delete.py --bucket example-1250000000 --region ap-shanghai
+```
+
+1. 只处理有 `SUCCESS`（`publish.sh` 已部署成功）的文件夹；没有 `SUCCESS` 的文件夹给出警告并跳过，其中的对象不删除。清单 `bucket` 与 `--bucket` 不同的文件夹跳过；以 `.` 开头的目录和普通文件忽略。已发布的文件夹缺少 `manifest.json`、清单无法解析，或同一 key 记录在多份清单中时，在连接 COS 之前报错退出，不删除任何对象。
+2. 删除前用 `list_objects` 完整列举一次存储桶。只有大小和 `LastModified` 仍与清单一致的对象才删除；归档后被覆盖的对象，新内容不在归档中，逐个警告并保留；清单中有、COS 中已没有的 key 视为已删除。清单以外的对象不受影响。
+3. 每个请求最多删除 1000 个 key（Quiet 模式的 `delete_objects`），`--workers` 控制同时进行的请求数，默认 8。请求出错或个别 key 删除失败时，每批最多尝试 `--attempts` 次，默认 3；HTTP 4xx（408、429 除外）或 `AccessDenied` 立即停止。
+4. 文件夹的 key 全部删除（或本就不存在）后，在其中写入空的 `COS_DELETED` 标记，以后运行直接跳过该文件夹。有删除失败或归档后变化对象的文件夹不写标记，下次运行重新核对。`--dry-run` 只列举核对，输出每个文件夹待删除、已不存在、已变化的数量，不删除也不写标记。
+
+有 key 删除失败时退出码为 1，重新执行同一命令即可继续。分批迁移时，可在每轮 `publish.sh --all` 之后运行；`tmp` 已纳入仓库，记得提交新写入的 `COS_DELETED` 标记。核对与删除之间不是原子操作，核对后才被覆盖的对象仍会被删除。存储桶开启版本控制时，删除只会添加删除标记，历史版本仍保留并计费。
